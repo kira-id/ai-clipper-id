@@ -7,19 +7,21 @@ PROMPTS = {
 
 Tasks:
 1. Read the transcript carefully and identify the central claim, tension, or insight.
-2. Rewrite these fields only: title, topic, caption, reason, hook.
+2. Rewrite these fields only: reason, title, topic, caption, comment_bait, hook, closing_line.
 3. Keep all timing, score, rank, and filename fields unchanged.
 4. Return the same JSON array with exactly one item.
 
-Field requirements:
-- title: max 8 words, curiosity-driven, specific to the transcript
-- topic: one clear sentence describing the core idea or debate
-- caption: natural creator-style caption, accurate to the transcript, include relevant hashtags
+Field requirements (in this order):
 - reason: 1-2 sentences explaining why this full-video clip is compelling or worth watching
+- title: Max 8 words. No jargon. Non-technical audience. Apply jargon translation (LLM → "otak AI", etc.). Use viral formula (Number+Outcome, Expose Lie, Secret, Comparison, Personal Stakes, or How+Wonder).
+- topic: one clear sentence describing the core idea or debate
+- caption: 4-part structure (hook line → insight → CTA → hashtags). Total max 280 chars.
+- comment_bait: Single opinion/experience question to drive comments. Under 15 words. NOT a knowledge quiz.
 - hook: the strongest opening line or a tightened version that stays faithful to the transcript
+- closing_line: The EXACT last words from the transcript — word-for-word. Must be a strong ending.
 
 Language rules:
-- If the transcript is in Indonesian, write title, topic, caption, reason, and hook in Indonesian.
+- If the transcript is in Indonesian, write reason, title, topic, caption, comment_bait, hook, and closing_line in Indonesian.
 - Do not use the filename or generic placeholders as metadata.
 - Do not invent facts not supported by the transcript.
 
@@ -27,7 +29,7 @@ Return ONLY valid JSON array, no other text.""",
 
     "Translate to Indonesian": """Given clips data in JSON format, perform the following:
 
-1. For each clip, analyze the language of the fields: topic, caption, hook
+1. For each clip, analyze the language of the fields: reason, topic, caption, hook, closing_line, comment_bait
 2. If any of these fields are NOT in Indonesian (Bahasa Indonesia), translate them to Indonesian
 3. If they are already in Indonesian, keep them unchanged
 4. Preserve the meaning, tone, and marketing appeal during translation
@@ -65,6 +67,8 @@ Return ONLY valid JSON array with fixed clips, no other text.""",
 
 1. Improve each clip's content:
    - Do NOT change the "title" field — keep it exactly as-is
+   - For captions: verify 4-part structure (hook → insight → CTA → hashtags) is intact. If flat, restructure.
+   - Verify comment_bait is a genuine opinion/experience question, not a knowledge quiz.
    - Enhance captions with power words that drive engagement
    - Ensure topics are clear categories or themes
    - Strengthen hooks for maximum stop-scroll potential
@@ -126,6 +130,24 @@ Rules:
 - Add appropriate punctuation for spoken content
 - Keep the exact same number of items in the output array
 - If text is already correct Indonesian, just add punctuation and return unchanged
+
+JARGON SIMPLIFICATION (mandatory — translate technical terms to plain Indonesian in subtitles):
+- "large language model" / "LLM" → "model AI" atau "otak AI"
+- "RAG" / "Retrieval Augmented Generation" → "AI yang baca dokumen"
+- "fine-tuning" → "melatih AI"
+- "embeddings" / "vector" → "representasi data"
+- "prompt engineering" → "cara ngomong ke AI"
+- "token" / "tokenizer" → "satuan teks"
+- "context window" → "memori AI"
+- "hallucination" → "AI yang ngarang"
+- "inference" → "proses AI berpikir"
+- "AI agent" → "AI yang bisa kerja sendiri"
+- "machine learning" → "mesin yang belajar"
+- "neural network" → "jaringan saraf AI"
+- "GPU" → "prosesor AI"
+- "API" → "penghubung program"
+- If a term is not listed: explain what it DOES, not what it IS. Keep it to 1-2 words max.
+- Do NOT over-explain: subtitle must stay natural speech. Just swap the term, keep the sentence.
 
 Example:
 Input:  [{"id": 0, "text": "jadi gini ya ai tuh sekarang canggih banget", "start": 0.0, "end": 2.5}]

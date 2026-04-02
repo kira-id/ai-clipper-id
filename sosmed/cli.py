@@ -242,6 +242,13 @@ def main() -> None:
     ap.add_argument("--music-volume", type=float, default=defaults["music_volume"],
                     help=f"Background music volume 0.0-1.0 (default: {defaults['music_volume']})")
 
+    # ── Encoding quality & speed ─────────────────────────────────────────
+    ap.add_argument("--encoding-preset", default=defaults.get("encoding_preset", "veryfast"),
+                    choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
+                    help="ffmpeg x264 encoding preset (default: from config or veryfast)")
+    ap.add_argument("--encoding-crf", type=int, default=defaults.get("encoding_crf", 23),
+                    help="ffmpeg x264 CRF quality (18-28, lower=better; default: from config or 23)")
+
     # ── Silence removal ──────────────────────────────────────────────────
     ap.add_argument("--remove-silence", action=argparse.BooleanOptionalAction,
                     default=defaults["silence_removal_enabled"],
@@ -256,6 +263,10 @@ def main() -> None:
                     default=_cta_defaults.get("enabled", False),
                     help="Append Instagram follow CTA at the end of each clip "
                          f"(default: {'on' if _cta_defaults.get('enabled') else 'off'})")
+
+    # ── Caching & skip options ───────────────────────────────────────────
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Skip processing if final output file already exists")
 
     # ── Testing options ──────────────────────────────────────────────────
     ap.add_argument("--example", action="store_true",
@@ -378,6 +389,8 @@ def main() -> None:
                 enable_silence_removal=args.remove_silence,
                 max_silence=args.max_silence,
                 cta_config=_cta_cfg,
+                encoding_preset=args.encoding_preset,
+                encoding_crf=args.encoding_crf,
             )
         else:
             outputs = raw_outputs
@@ -399,6 +412,29 @@ def main() -> None:
         sys.exit(1)
 
     output_dir = Path(args.output) / video.stem
+
+    # ── Check for existing output ───────────────────────────────────────────
+    if args.skip_existing:
+        clips_json = output_dir / "all_clips.json"
+        if not clips_json.exists():
+            clips_json = output_dir / "clips.json"
+        if clips_json.exists():
+            clips_data = json.loads(clips_json.read_text())
+            if clips_data:
+                final_filename = clips_data[0].get("filename")
+                if final_filename:
+                    final_file = output_dir / final_filename
+                    if final_file.exists():
+                        log("OK", f"Output already exists: {final_file}")
+                        log("OK", "Skipping processing (use without --skip-existing to force re-run)")
+                        best_clip = clips_data[0]
+                        print(f"\n{GREEN}{BOLD}✓ Complete!{RESET}")
+                        print(f"  Output: {final_file}")
+                        print()
+                        print(f"{BOLD}Topic:{RESET} {best_clip.get('topic', 'N/A')}")
+                        print(f"{BOLD}Title:{RESET} {best_clip.get('title', 'N/A')}")
+                        print(f"{BOLD}Caption:{RESET} {best_clip.get('caption', 'N/A')}")
+                        return
 
     print(f"\n{BOLD}{CYAN}{'═' * 50}")
     print(f"   AI Video Clipper — Indonesian-optimized")
@@ -598,6 +634,8 @@ def main() -> None:
             enable_silence_removal=args.remove_silence,
             max_silence=args.max_silence,
             cta_config=_cta_cfg,
+            encoding_preset=args.encoding_preset,
+            encoding_crf=args.encoding_crf,
         )
     else:
         outputs = raw_outputs

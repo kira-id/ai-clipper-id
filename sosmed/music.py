@@ -368,8 +368,9 @@ def apply_music_to_clip(
 ) -> bool:
     """Mix background music into an existing video clip.
 
-    Main audio is loudnorm-normalized (loud target: -7 LUFS, 1.5x louder) then music is
-    added additively (amix normalize=0) so voice volume is not reduced.
+    Main audio is normalized for social media loudness (-10 LUFS) with
+    enough headroom to avoid capping, then music is added additively
+    (amix normalize=0) so voice volume is not reduced.
 
     Args:
         clip_path: Input video file path.
@@ -405,7 +406,9 @@ def apply_music_to_clip(
         log("WARN", f"Zero duration for {clip_path}, skipping music")
         return False
 
-    voice_filter = "[0:a]volume=5.5dB,loudnorm=I=-7:LRA=7:TP=-1[voice]"
+    # Speech-optimized: -13 LUFS, LRA=7 for tight, clear narration
+    # No pre-amp — source audio already has good levels
+    voice_filter = "[0:a]loudnorm=I=-13:LRA=7:TP=-1.0[voice]"
     music_filter = build_music_filter(1, duration, music_volume)
     mix_filter = "[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
 

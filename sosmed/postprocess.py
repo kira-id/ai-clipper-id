@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from .config import get_defaults
 from .music import build_music_filter
 from .subtitles import generate_ass_subtitles, generate_title_overlay
 from .utils import get_ffmpeg, get_ffprobe, log
@@ -24,6 +25,18 @@ def _escape_ass_path(path: str) -> str:
     for ch in ":'[];,":
         escaped = escaped.replace(ch, f"\\{ch}")
     return escaped
+
+
+def _is_videotoolbox_available() -> bool:
+    """Check if h264_videotoolbox encoder is available (macOS hardware acceleration)."""
+    try:
+        result = subprocess.run(
+            [get_ffmpeg(), "-encoders"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "h264_videotoolbox" in result.stdout
+    except Exception:
+        return False
 
 
 def _compute_orientation_target(
@@ -91,22 +104,39 @@ def _get_video_info(video_path: str) -> dict[str, Any]:
 
         dur = float(stream.get("duration", 0) or fmt.get("duration", 0))
 
-        # Check for audio stream
+        # Check for audio stream and get sample rate + audio duration
         result2 = subprocess.run(
             [
                 get_ffprobe(), "-v", "error",
                 "-select_streams", "a:0",
-                "-show_entries", "stream=codec_type",
+                "-show_entries", "stream=codec_type,sample_rate,duration",
                 "-of", "csv=p=0",
                 video_path,
             ],
             capture_output=True, text=True,
         )
         has_audio = bool(result2.stdout.strip())
+        sample_rate = 44100  # default
+        audio_duration = 0.0
+        if has_audio and result2.stdout.strip():
+            # Output format: codec_type,sample_rate,duration
+            parts = result2.stdout.strip().split(",")
+            if len(parts) >= 2:
+                try:
+                    sample_rate = int(parts[1])
+                except ValueError:
+                    pass
+            if len(parts) >= 3:
+                try:
+                    audio_duration = float(parts[2])
+                except ValueError:
+                    pass
 
         return {
             "width": w, "height": h, "fps": fps,
             "duration": dur, "has_audio": has_audio, "has_video": True,
+            "sample_rate": sample_rate,
+            "audio_duration": audio_duration,
         }
     except Exception as e:
         log("WARN", f"ffprobe failed: {e}")
@@ -134,6 +164,9 @@ def _postprocess_one(
     enable_silence_removal: bool = False,
     max_silence: float = 1.5,
     cta_config: dict[str, Any] | None = None,
+    encoding_preset: str | None = None,
+    encoding_crf: int | None = None,
+    use_hwaccel: bool = True,
 ) -> str:
     """Post-process a single clip with all enhancements.
 
@@ -381,11 +414,13 @@ def _postprocess_one(
     if silence_filter_a:
         afilters.append(silence_filter_a)
 
-    # Audio loudnorm - aggressive normalization for social media (-7 LUFS, 1.5x louder)
-    # Add 5.5dB pre-amp for quiet sources, then normalize
+    # Audio normalization for social media speech — loud and clear.
+    # Target: -13 LUFS (matches TikTok/Instagram/YouTube normalization).
+    # LRA=7 keeps speech tight and consistent — quiet parts stay intelligible.
+    # TP=-1.0 dB prevents harsh limiting; platforms normalize down, not up.
+    # No pre-amp needed — source audio already has good levels.
     if has_audio:
-        afilters.append("volume=5.5dB")
-        afilters.append("loudnorm=I=-7:LRA=7:TP=-1")
+        afilters.append("loudnorm=I=-13:LRA=7:TP=-1.0")
 
     if has_audio and afilters:
         afilter_str = ",".join(afilters)
@@ -424,8 +459,29 @@ def _postprocess_one(
     else:
         audio_enc = ["-c:a", "aac"]
 
+    # Load encoding settings from config if not provided
+    if encoding_preset is None or encoding_crf is None:
+        defaults = get_defaults()
+        if encoding_preset is None:
+            encoding_preset = defaults.get("encoding_preset", "veryfast")
+        if encoding_crf is None:
+            encoding_crf = defaults.get("encoding_crf", 23)
+
+    # Check hardware acceleration setting from config
+    defaults = get_defaults()
+    use_hwaccel = use_hwaccel and defaults.get("hwaccel", True)
+
+    # Use hardware acceleration on macOS (VideoToolbox) for faster encoding
+    # Fall back to libx264 if hwaccel disabled or not available
     if vfilters_chain or silence_filter_v:
-        video_enc = ["-c:v", "libx264", "-preset", "fast", "-crf", "23"]
+        if use_hwaccel and _is_videotoolbox_available():
+            # VideoToolbox: very fast, good quality for social media
+            # Note: h264_videotoolbox doesn't support CRF, use quality/speed instead
+            video_enc = ["-c:v", "h264_videotoolbox", "-quality", "speed"]
+            log("DEBUG", f"Clip #{clip.get('rank')}: using VideoToolbox hardware acceleration")
+        else:
+            # libx264 with configurable preset/CRF
+            video_enc = ["-c:v", "libx264", "-preset", encoding_preset, "-crf", str(encoding_crf)]
     else:
         video_enc = ["-c:v", "copy"]
 
@@ -493,6 +549,9 @@ def postprocess_clips(
     enable_silence_removal: bool = False,
     max_silence: float = 1.5,
     cta_config: dict[str, Any] | None = None,
+    encoding_preset: str | None = None,
+    encoding_crf: int | None = None,
+    use_hwaccel: bool = True,
 ) -> list[str]:
     """Post-process all extracted clips.
 
@@ -572,6 +631,9 @@ def postprocess_clips(
                 enable_silence_removal=enable_silence_removal,
                 max_silence=max_silence,
                 cta_config=cta_config,
+                encoding_preset=encoding_preset,
+                encoding_crf=encoding_crf,
+                use_hwaccel=use_hwaccel,
             )
             futures[fut] = clip
 

@@ -1052,11 +1052,34 @@ def upload_instagram(video_path: str, clip: dict) -> bool:
 
         log.info(f"📤 Instagram: uploading {clip.get('title', '?')}...")
         _human_pause(1, 3)
+        
+        # Upload the clip
         ig.clip_upload(path=video_path, caption=unique_caption, thumbnail=thumbnail_path)
         _post_login_cooldown()
+        
+        # Get the media ID to post comment
+        media_id = None
+        try:
+            # Try to get the recently uploaded media
+            user_id = ig.user_id()
+            medias = ig.user_medias(user_id, amount=1)
+            if medias:
+                media_id = str(medias[0].pk)
+                log.debug(f"📎 Instagram: got media ID {media_id} for commenting")
+        except Exception as e:
+            log.warning(f"⚠️  Instagram: could not get media ID for comment: {e}")
+        
         _daily_counts["instagram"] += 1
         log.info(f"✅ Instagram: {clip.get('title', '?')} uploaded successfully [{_daily_counts['instagram']}/{_daily_target} today]")
         log.info(f"🖼️ Instagram thumbnail uploaded: {thumbnail_path}")
+        
+        # Post comment_bait as first comment (after upload success)
+        comment_bait = clip.get("comment_bait", "")
+        if comment_bait and media_id:
+            # Wait a bit before commenting (looks more natural)
+            _human_pause(30, 90)  # 30-90 seconds after upload
+            post_instagram_comment(ig, media_id, comment_bait)
+        
         return True
     except Exception as e:
         log.error(f"❌ Instagram: {type(e).__name__}: {e}")
@@ -1142,18 +1165,27 @@ def upload_youtube(video_path: str, clip: dict) -> bool:
             notifySubscribers=YOUTUBE_NOTIFY_SUBSCRIBERS,
         )
         resp = req.execute()
+        video_id = resp["id"]
 
         # Upload thumbnail
         _human_pause(1, 3)
         yt.thumbnails().set(
-            videoId=resp["id"],
+            videoId=video_id,
             media_body=MediaFileUpload(thumbnail_path, mimetype="image/jpeg"),
         ).execute()
 
         _post_login_cooldown()
         _daily_counts["youtube"] += 1
-        log.info(f"✅ YouTube: https://youtube.com/shorts/{resp['id']} [{_daily_counts['youtube']}/{_daily_target} today]")
+        log.info(f"✅ YouTube: https://youtube.com/shorts/{video_id} [{_daily_counts['youtube']}/{_daily_target} today]")
         log.info(f"🖼️ YouTube thumbnail: {thumbnail_path}")
+        
+        # Post comment_bait as first comment (after upload success)
+        comment_bait = clip.get("comment_bait", "")
+        if comment_bait:
+            # Wait a bit before commenting (looks more natural)
+            _human_pause(60, 180)  # 1-3 minutes after upload
+            post_youtube_comment(yt, video_id, comment_bait)
+        
         return True
     except Exception as e:
         error_str = str(e)
@@ -1261,10 +1293,23 @@ def upload_tiktok(video_path: str, clip: dict) -> bool:
             log.error(f"❌ TikTok: failed to generate thumbnail")
             return False
 
+        # Build description with caption + comment_bait for engagement
         unique_caption = unique_ify_caption(clip.get("caption", ""))
+        comment_bait = clip.get("comment_bait", "").strip()
+        
+        # Add comment_bait to description (increases engagement signal)
+        if comment_bait:
+            # Add line break and comment bait as engagement prompt
+            description = f"{unique_caption}\n\n💬 {comment_bait}"
+        else:
+            description = unique_caption
+        
+        # TikTok description limit: 2200 chars
+        description = description[:2200]
+        
         video_dict = {
             "path": video_path,
-            "description": unique_caption[:2200],
+            "description": description,
             "cover": thumbnail_path,
         }
 
@@ -1298,6 +1343,99 @@ def upload_tiktok(video_path: str, clip: dict) -> bool:
         else:
             log.error(f"❌ TikTok: {e}")
         return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  Auto-comment functions — post comment_bait as first comment
+# ═══════════════════════════════════════════════════════════
+
+
+def post_instagram_comment(ig: IGClient, media_id: str, comment_text: str) -> bool:
+    """Post a comment on an Instagram media (clip/reel).
+    
+    Args:
+        ig: Instagrapi client instance
+        media_id: Instagram media ID (numeric string)
+        comment_text: The comment text to post
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not comment_text or not comment_text.strip():
+        log.debug("⏭️  Instagram: no comment_bait to post")
+        return True  # Not an error, just nothing to do
+    
+    try:
+        log.info(f"💬 Instagram: posting comment on media {media_id}...")
+        _human_pause(2, 5)  # Human-like delay before commenting
+        
+        # Post the comment
+        result = ig.media_comment(media_id=media_id, text=comment_text.strip())
+        
+        if result:
+            log.info(f"✅ Instagram: comment posted successfully")
+            return True
+        else:
+            log.error(f"❌ Instagram: media_comment returned False")
+            return False
+    except Exception as e:
+        log.error(f"❌ Instagram comment failed: {type(e).__name__}: {e}")
+        return False
+
+
+def post_youtube_comment(yt, video_id: str, comment_text: str) -> bool:
+    """Post a comment on a YouTube video.
+    
+    Args:
+        yt: YouTube API client instance
+        video_id: YouTube video ID
+        comment_text: The comment text to post
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not comment_text or not comment_text.strip():
+        log.debug("⏭️  YouTube: no comment_bait to post")
+        return True  # Not an error, just nothing to do
+    
+    try:
+        log.info(f"💬 YouTube: posting comment on video {video_id}...")
+        _human_pause(3, 8)  # Longer human-like delay for YouTube
+        
+        # Create comment via YouTube Data API v3
+        response = yt.commentThreads().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "videoId": video_id,
+                    "topLevelComment": {
+                        "snippet": {
+                            "videoId": video_id,
+                            "textOriginal": comment_text.strip()
+                        }
+                    }
+                }
+            }
+        ).execute()
+        
+        comment_id = response.get("id", "unknown")
+        log.info(f"✅ YouTube: comment posted successfully (ID: {comment_id})")
+        return True
+    except Exception as e:
+        error_str = str(e)
+        if "quotaExceeded" in error_str or "403" in error_str:
+            log.error("❌ YouTube: Daily API quota exceeded for comments")
+        elif "commentsDisabled" in error_str or "comments disabled" in error_str.lower():
+            log.warning(f"⚠️  YouTube: comments are disabled on this video")
+            return True  # Not our fault, video has comments disabled
+        else:
+            log.error(f"❌ YouTube comment failed: {type(e).__name__}: {e}")
+        return False
+
+
+# TikTok commenting requires browser automation which is complex.
+# For now, we skip TikTok auto-comments. The comment_bait can still
+# be used manually or added to the video description.
 
 
 # ═══════════════════════════════════════════════════════════

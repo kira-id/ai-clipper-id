@@ -94,6 +94,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "music_volume": 0.06,
         "silence_removal_enabled": True,
         "max_silence_duration": 1.5,
+        "encoding_preset": "veryfast",  # ffmpeg x264 preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+        "encoding_crf": 23,  # Quality: 18-28 (lower=better, 23=good balance for social media)
+        "hwaccel": True,  # Enable hardware acceleration (VideoToolbox on macOS, NVENC on NVIDIA)
     },
     "pixabay": {
         "min_duration": 30,

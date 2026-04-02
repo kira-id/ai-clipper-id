@@ -294,11 +294,12 @@ def _validate_clips(
         # Ensure required fields
         c.setdefault("rank", len(valid) + 1)
         c.setdefault("title", f"Clip {c['rank']}")
+        c.setdefault("reason", "")
         c.setdefault("topic", "")
         c.setdefault("caption", "")
-        c.setdefault("reason", "")
         c.setdefault("hook", "")
         c.setdefault("closing_line", "")
+        c.setdefault("comment_bait", "")
         c.update(normalized)
         c["clip_score"] = score
         c.pop("_score", None)

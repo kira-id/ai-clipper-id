@@ -232,7 +232,7 @@ def tighten_clip_boundaries(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━ CONSTANTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Default free model on OpenRouter
-DEFAULT_OPENROUTER_MODEL = "arcee-ai/trinity-large-preview:free"
+DEFAULT_OPENROUTER_MODEL = "qwen/qwen3.6-plus-preview:free"
 DEFAULT_OPENROUTER_BASE  = "https://openrouter.ai/api/v1"
 
 MAX_CLIPS_HARD_LIMIT = 72  # absolute ceiling — quality over quantity
@@ -356,7 +356,7 @@ VIRAL CONTENT DEFINED:
 
 Clip duration: {min_dur}–{max_dur} seconds. Maximum {max_clips} clips. Output JSON array only — no explanation, no markdown fence.
 
-IMPORTANT — LANGUAGE: ALL text fields (topic, reason, hook, caption, title) MUST be written in Bahasa Indonesia. Match the language of the transcript. Do NOT write these fields in English.
+IMPORTANT — LANGUAGE: ALL text fields (reason, topic, hook, caption, title, closing_line, comment_bait) MUST be written in Bahasa Indonesia. Match the language of the transcript. Do NOT write these fields in English.
 
 ---
 
@@ -427,6 +427,7 @@ Reject any clip that is:
 - Long silence (>3s) before first speech
 - No clear ending — trails off or gets cut mid-thought
 - Generic context-setting without any insight
+- Clips where 90%+ of the content is pure technical specification without any human angle, story, or relatable moment — reject these (they don't work as standalone Shorts for non-technical viewers)
 
 Everything else moves to Step 2 for scoring.
 
@@ -462,12 +463,12 @@ score_emotional_payoff — Does it trigger a reaction?
 30–49  | FLAT: Informative but emotionally dead. No reaction.
 0–29   | NONE: Completely forgettable.
 
-score_clarity — Does it work standalone?
-90–100 | FULLY SELF-CONTAINED: Any viewer understands it cold. No context needed.
-70–89  | MOSTLY CLEAR: Minor context gap but still understandable.
-50–69  | UNDERSTANDABLE: Needs basic topic knowledge.
-30–49  | CONFUSING: Requires watching full source to make sense.
-0–29   | UNINTELLIGIBLE: Completely lost without context.
+score_clarity — Does it work for a NON-TECHNICAL viewer with zero AI background?
+90–100 | FULLY ACCESSIBLE: Any Indonesian viewer understands it cold — no tech background needed.
+70–89  | MOSTLY CLEAR: Minor context gap, but the emotional/human angle still lands.
+50–69  | REQUIRES BASIC KNOWLEDGE: Needs some AI familiarity to follow.
+30–49  | CONFUSING: Only makes sense to people already in AI.
+0–29   | IMPENETRABLE: Pure jargon, no human angle.
 
 ---
 
@@ -487,6 +488,7 @@ INCLUDE the clip ONLY if ALL are true:
 - clip_score ≥ {min_score}
 - score_hook ≥ 60 (no weak hooks allowed)
 - score_retention ≥ 50 (must have strong ending)
+- score_clarity ≥ 50 (must be accessible to non-technical viewers)
 - At least TWO individual scores ≥ 70
 
 BE CONSERVATIVE — It's better to return 3 viral clips than 20 mediocre ones.
@@ -497,23 +499,70 @@ DEDUPLICATE: If two clips cover the same moment, keep ONLY the one with higher c
 
 STEP 5 — GENERATE FIELDS (VIRAL-OPTIMIZED)
 
-(1) topic
-- One sentence: What makes this clip SHAREABLE and VIRAL-WORTHY.
+**Before writing JSON, reason through each clip:**
+- Why is this moment engaging? What's the viral trigger?
+- Does the hook grab attention in 2 seconds?
+- Does the ending feel complete or cut off?
+- Would a non-technical viewer understand this?
 
-(2) reason
+Then generate these fields (in this order):
+
+(1) reason
 - 1-2 sentences: Why a viewer WILL watch to the end and SHARE or COMMENT. Be specific about the viral trigger.
+
+(2) topic
+- One sentence: What makes this clip SHAREABLE and VIRAL-WORTHY.
 
 (3) hook
 - The EXACT first words from the transcript — word-for-word, NOT a summary. This MUST be a viral hook pattern (see requirements above).
 
 (4) caption
-- Punchy social media caption with engagement potential. Include 2-4 relevant hashtags.
+- Write in 4 parts, separated by line breaks. Total max 280 chars.
+  PART 1 — HOOK LINE (max 100 chars, NO hashtags):
+    • Visible BEFORE "more" button. Must work as standalone scroll-stopper.
+    • State the core tension, shocking fact, or relatable frustration. Casual Bahasa Indonesia.
+    • GOOD: "Ternyata cara lo ngomong ke AI menentukan seberapa pintar jawabannya."
+    • BAD: "Video ini membahas tentang prompt engineering untuk AI."
+  PART 2 — INSIGHT (1-2 sentences): One concrete thing viewer learns or can use immediately.
+  PART 3 — CTA (pick most fitting):
+    • Teaches actionable thing → "Simpan dulu sebelum ilang."
+    • Surprising/debatable → "Kamu setuju? Komen di bawah."
+    • Community-relevant → "Tag temen yang lagi belajar AI."
+    • Creates appetite for more → "Mau bahas lebih dalam? Komen 'lanjut'."
+  PART 4 — HASHTAGS (2-4): 1 broad (#AI), 1 mid-tier (#AIIndonesia), 1 niche (topic-specific), 1 trending if relevant.
 
 (5) title
-- Max 8 words. Click-worthy, scroll-stopping, curiosity-driven.
+- For TikTok/Instagram/YouTube on-screen overlay AND metadata. Max 8 words. No jargon. Non-technical audience.
+- JARGON TRANSLATION (never use raw technical terms in titles):
+    • LLM/GPT → "otak AI" atau "AI paling canggih"
+    • RAG → "AI yang bisa baca dokumenmu"
+    • Fine-tuning → "ngajarin AI dari nol"
+    • Embeddings → "cara AI ngerti makna kata"
+    • Prompt engineering → "trik dapetin hasil AI terbaik"
+    • Token/tokenizer → "satuan pikiran AI"
+    • Context window → "memori AI"
+    • Hallucination → "AI yang ngarang fakta"
+    • AI agent → "AI yang bisa kerja sendiri"
+    • Unknown term → translate to what it DOES for users, not what it IS.
+- PICK ONE viral formula:
+    A — Number + Outcome: "[N] Cara [Outcome] Pakai AI"
+    B — Expose the Lie: "Semua Orang Salah soal [Topik]..."
+    C — Secret: "Ini yang Nggak Diajarkan di [Tempat]..."
+    D — Comparison Shock: "[A] vs [B] — Siapa Lebih [Outcome]?"
+    E — Personal Stakes: "Kalau Lo Belum Tau Ini, Lo Bakal [Kerugian]"
+    F — How + Wonder: "Gimana [AI/Tool] Bisa [Hal yang Mustahil Kedengarannya]"
+- NEVER: acronyms first (RAG, LLM, API), passive voice ("Dibahas:"), pure description.
+- GOOD: "Kenapa AI Bisa Bohong Tanpa Sadar?" | BAD: "Penjelasan Hallucination di LLM"
 
 (6) closing_line
 - The EXACT last words from the transcript — word-for-word. Must be a strong ending (see requirements above).
+
+(7) comment_bait
+- Single question to drive COMMENTS. Under 15 words. Casual Bahasa Indonesia.
+- Must be an OPINION or experience-sharing prompt — NOT a knowledge quiz.
+- GOOD: "Menurut lo, AI bakal gantiin programmer dalam 5 tahun?"
+- GOOD: "Ada yang udah pernah coba ini? Hasilnya gimana?"
+- NEVER: "Apa itu X?", "Subscribe ya!", "Like kalau suka!"
 
 ---
 
@@ -526,12 +575,13 @@ Return a JSON array sorted by clip_score descending. Each object MUST have ALL o
   {{
     "start": 34.5,
     "end": 83.2,
-    "topic": "...",
     "reason": "...",
+    "topic": "...",
     "hook": "...",
     "closing_line": "...",
     "caption": "...",
     "title": "...",
+    "comment_bait": "...",
     "score_hook": 85,
     "score_insight_density": 78,
     "score_retention": 72,
@@ -542,5 +592,5 @@ Return a JSON array sorted by clip_score descending. Each object MUST have ALL o
 ]
 ```
 
-CRITICAL: Every clip MUST include start, end, ALL five score_* fields (integers 0-100), clip_score (float), and closing_line. Clips missing scores will be discarded.
+CRITICAL: Every clip MUST include start, end, reason, ALL five score_* fields (integers 0-100), clip_score (float), closing_line, title, and comment_bait. Clips missing scores will be discarded.
 """

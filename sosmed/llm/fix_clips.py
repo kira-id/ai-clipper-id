@@ -43,7 +43,7 @@ def generate_single_clip_metadata(
     user_title = str(clip.get("title", "") or "").strip()
     user_caption = str(clip.get("caption", "") or "").strip()
 
-    for field in ["title", "topic", "caption", "reason", "hook"]:
+    for field in ["title", "topic", "caption", "reason", "hook", "closing_line", "comment_bait"]:
         # Skip if user already provided this field
         if field == "title" and user_title:
             continue

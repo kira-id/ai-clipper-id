@@ -112,6 +112,17 @@ defaults:
   silence_removal_enabled: true
   max_silence_duration: 1.5  # seconds
 
+  # Video encoding quality & speed (ffmpeg x264)
+  # preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
+  # CRF: 18-28 (lower = better quality, larger file; 23 is good for social media)
+  encoding_preset: veryfast
+  encoding_crf: 23
+  
+  # Hardware acceleration (macOS: VideoToolbox, NVIDIA: NVENC)
+  # Much faster encoding (2-5x) with slightly larger file sizes
+  # Set to false to use libx264 software encoding instead
+  hwaccel: true
+
 # ── Instagram CTA ─────────────────────────────────────────────────────────
 # When enabled, each clip ends with a fade-to-black "Follow us on Instagram"
 # screen — animated account name, username, and a "Follow" button with a
