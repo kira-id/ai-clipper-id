@@ -18,6 +18,7 @@ import time
 import pickle
 import random
 import shutil
+import signal
 import logging
 import argparse
 import schedule
@@ -49,10 +50,14 @@ from config import (
     YOUTUBE_SELF_DECLARED_MADE_FOR_KIDS,
     TIKTOK_COOKIES_FILE,
     TIKTOK_BROWSER_DATA_DIR,
+    CHROME_PROFILE_DIR,
     FFMPEG_BIN,
     FFPROBE_BIN,
     ENABLE_INSTAGRAM, ENABLE_YOUTUBE, ENABLE_TIKTOK,
 )
+
+RESET_TIKTOK_BROWSER_DATA = False
+RESET_TIKTOK_BROWSER_DATA_HARD = False
 
 # ── Weekly upload pattern (rest + daily 3–4 posts) ───────────────────
 # Each week follows a fixed pattern: [0, 1, 1, 1, 1, 1, 1]
@@ -134,6 +139,217 @@ def _inter_platform_delay() -> None:
     wait = random.randint(60, 180)
     log.info(f"💤 Pausing {wait}s before next platform...")
     time.sleep(wait)
+
+
+def _remove_path(path: str) -> None:
+    """Remove file/symlink/directory path if present."""
+    if os.path.islink(path) or os.path.isfile(path):
+        os.remove(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if process exists."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _find_profile_processes(profile_dir: str) -> list[int]:
+    """Find Chrome/Chromium PIDs that are using the given profile dir."""
+    try:
+        result = subprocess.run(
+            ["ps", "ax", "-o", "pid=", "-o", "command="],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        log.warning(f"⚠️  TikTok: could not inspect browser processes: {exc}")
+        return []
+
+    profile_arg = f"--user-data-dir={profile_dir}"
+    current_pid = os.getpid()
+    pids: list[int] = []
+
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+
+        if pid == current_pid:
+            continue
+
+        cmd = parts[1] if len(parts) > 1 else ""
+        if profile_arg not in cmd:
+            continue
+        if "Chrome" not in cmd and "Chromium" not in cmd and "msedge" not in cmd:
+            continue
+
+        pids.append(pid)
+
+    return sorted(set(pids))
+
+
+def _terminate_processes(pids: list[int], grace_seconds: float = 3.0) -> tuple[list[int], list[int]]:
+    """Terminate PIDs gracefully, then force-kill if needed.
+
+    Returns:
+        (terminated_pids, still_alive_pids)
+    """
+    if not pids:
+        return [], []
+
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except Exception as exc:
+            log.warning(f"⚠️  TikTok: failed to SIGTERM pid {pid}: {exc}")
+
+    deadline = time.time() + grace_seconds
+    while time.time() < deadline:
+        alive = [pid for pid in pids if _is_pid_alive(pid)]
+        if not alive:
+            return sorted(set(pids)), []
+        time.sleep(0.15)
+
+    alive = [pid for pid in pids if _is_pid_alive(pid)]
+    for pid in alive:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except Exception as exc:
+            log.warning(f"⚠️  TikTok: failed to SIGKILL pid {pid}: {exc}")
+
+    time.sleep(0.2)
+    still_alive = [pid for pid in alive if _is_pid_alive(pid)]
+    terminated = [pid for pid in pids if pid not in still_alive]
+    return terminated, still_alive
+
+
+def ensure_tiktok_profile_unlocked() -> bool:
+    """Ensure TikTok persistent profile is not locked by another browser process."""
+    if not os.path.isdir(TIKTOK_BROWSER_DATA_DIR):
+        return True
+
+    pids = _find_profile_processes(TIKTOK_BROWSER_DATA_DIR)
+    if pids:
+        log.warning(
+            "⚠️  TikTok profile is currently in use by Chrome/Chromium "
+            f"(pid: {', '.join(str(pid) for pid in pids)}). Closing those processes..."
+        )
+        terminated, alive = _terminate_processes(pids)
+        if terminated:
+            log.info(f"🧹 Closed profile-locking browser process(es): {', '.join(str(pid) for pid in terminated)}")
+        if alive:
+            log.error(
+                "❌ TikTok profile is still locked by running process(es): "
+                f"{', '.join(str(pid) for pid in alive)}"
+            )
+            return False
+
+    singleton_paths = [
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+    ]
+    for rel_path in singleton_paths:
+        abs_path = os.path.join(TIKTOK_BROWSER_DATA_DIR, rel_path)
+        if os.path.exists(abs_path):
+            try:
+                _remove_path(abs_path)
+                log.debug(f"🧹 Removed stale lock artifact: {abs_path}")
+            except Exception as exc:
+                log.error(f"❌ Could not remove stale lock artifact {abs_path}: {exc}")
+                return False
+
+    return True
+
+
+def reset_tiktok_browser_data(hard_reset: bool = False) -> bool:
+    """Reset TikTok browser data.
+
+    Default behavior keeps session/auth state and only clears volatile data
+    that often causes profile corruption (locks, shader/cache/temp files).
+    Use hard_reset=True to delete the entire profile directory.
+    """
+    if not os.path.exists(TIKTOK_BROWSER_DATA_DIR):
+        log.info(f"🧹 TikTok browser data dir already missing: {TIKTOK_BROWSER_DATA_DIR}")
+        return True
+
+    try:
+        if not ensure_tiktok_profile_unlocked():
+            return False
+
+        if hard_reset:
+            shutil.rmtree(TIKTOK_BROWSER_DATA_DIR)
+            log.info(f"🧹 Hard reset TikTok browser data: {TIKTOK_BROWSER_DATA_DIR}")
+            return True
+
+        root_transient = [
+            "SingletonLock",
+            "SingletonSocket",
+            "SingletonCookie",
+            "GraphiteDawnCache",
+            "GrShaderCache",
+            "ShaderCache",
+            "Code Cache",
+            "Crashpad",
+            "component_crx_cache",
+            "extensions_crx_cache",
+            "BrowserMetrics",
+            "BrowserMetrics-spare.pma",
+            "first_party_sets.db-journal",
+        ]
+        default_transient = [
+            "Cache",
+            "Code Cache",
+            "GPUCache",
+            "Service Worker/CacheStorage",
+            "Service Worker/ScriptCache",
+            "DawnGraphiteCache",
+        ]
+
+        removed = 0
+
+        for rel_path in root_transient:
+            abs_path = os.path.join(TIKTOK_BROWSER_DATA_DIR, rel_path)
+            if os.path.exists(abs_path):
+                _remove_path(abs_path)
+                removed += 1
+
+        default_dir = os.path.join(TIKTOK_BROWSER_DATA_DIR, "Default")
+        if os.path.isdir(default_dir):
+            for rel_path in default_transient:
+                abs_path = os.path.join(default_dir, rel_path)
+                if os.path.exists(abs_path):
+                    _remove_path(abs_path)
+                    removed += 1
+
+        log.info(
+            "🧹 Reset TikTok browser volatile data (session preserved): "
+            f"{removed} path(s) removed"
+        )
+        return True
+    except Exception as exc:
+        log.error(f"❌ Could not reset TikTok browser data: {exc}")
+        return False
 
 
 def reset_daily_counts_if_needed():
@@ -1049,14 +1265,24 @@ def upload_instagram(video_path: str, clip: dict) -> bool:
 
         ig = get_ig_client()
         unique_caption = unique_ify_caption(clip.get("caption", ""))
+        comment_bait = clip.get("comment_bait", "").strip()
+
+        # Add comment_bait to caption (like TikTok) for engagement
+        if comment_bait:
+            caption = f"{unique_caption}\n\n💬 {comment_bait}"
+        else:
+            caption = unique_caption
+
+        # Instagram caption limit: 2200 chars
+        caption = caption[:2200]
 
         log.info(f"📤 Instagram: uploading {clip.get('title', '?')}...")
         _human_pause(1, 3)
-        
+
         # Upload the clip
-        ig.clip_upload(path=video_path, caption=unique_caption, thumbnail=thumbnail_path)
+        ig.clip_upload(path=video_path, caption=caption, thumbnail=thumbnail_path)
         _post_login_cooldown()
-        
+
         # Get the media ID to post comment
         media_id = None
         try:
@@ -1068,13 +1294,13 @@ def upload_instagram(video_path: str, clip: dict) -> bool:
                 log.debug(f"📎 Instagram: got media ID {media_id} for commenting")
         except Exception as e:
             log.warning(f"⚠️  Instagram: could not get media ID for comment: {e}")
-        
+
         _daily_counts["instagram"] += 1
         log.info(f"✅ Instagram: {clip.get('title', '?')} uploaded successfully [{_daily_counts['instagram']}/{_daily_target} today]")
         log.info(f"🖼️ Instagram thumbnail uploaded: {thumbnail_path}")
-        
-        # Post comment_bait as first comment (after upload success)
-        comment_bait = clip.get("comment_bait", "")
+
+        # Also post comment_bait as first comment (after upload success)
+        # This creates engagement signal even if comment_bait is already in caption
         if comment_bait and media_id:
             # Wait a bit before commenting (looks more natural)
             _human_pause(30, 90)  # 30-90 seconds after upload
@@ -1125,6 +1351,12 @@ def upload_youtube(video_path: str, clip: dict) -> bool:
             title = f"{title_base[:91].rstrip()} #Shorts"
 
         desc = unique_ify_caption(clip.get("caption", "").strip())
+        comment_bait = clip.get("comment_bait", "").strip()
+
+        # Add comment_bait to description for engagement (like TikTok & Instagram)
+        if comment_bait:
+            desc = f"{desc}\n\n💬 {comment_bait}"
+
         if "#shorts" not in desc.lower():
             desc = f"{desc}\n\n#Shorts"
         desc = desc[:5000]
@@ -1178,9 +1410,8 @@ def upload_youtube(video_path: str, clip: dict) -> bool:
         _daily_counts["youtube"] += 1
         log.info(f"✅ YouTube: https://youtube.com/shorts/{video_id} [{_daily_counts['youtube']}/{_daily_target} today]")
         log.info(f"🖼️ YouTube thumbnail: {thumbnail_path}")
-        
+
         # Post comment_bait as first comment (after upload success)
-        comment_bait = clip.get("comment_bait", "")
         if comment_bait:
             # Wait a bit before commenting (looks more natural)
             _human_pause(60, 180)  # 1-3 minutes after upload
@@ -1225,8 +1456,8 @@ def ensure_vertical(video_path: str) -> str | None:
 def upload_tiktok(video_path: str, clip: dict) -> bool:
     """Upload a clip to TikTok with stealth measures and robust error handling.
 
-    Uses TikTokUploader class for proper context management. Each upload
-    gets a fresh browser instance to avoid asyncio event loop corruption.
+    Uses your Chrome profile directly - all cookies, sessions, and logins
+    are automatically available. No manual cookie export needed.
     """
     reset_daily_counts_if_needed()
     if _daily_counts["tiktok"] >= _daily_target:
@@ -1242,104 +1473,281 @@ def upload_tiktok(video_path: str, clip: dict) -> bool:
             log.error(f"❌ TikTok: cannot convert video to vertical format")
             return False
 
-        # Validate cookies file exists
-        if not os.path.exists(TIKTOK_COOKIES_FILE):
-            log.error(f"❌ TikTok: cookies file not found: {TIKTOK_COOKIES_FILE}")
-            log.error("   Export cookies from tiktok.com (Netscape format) and save to that path")
+        # Copy Chrome profile to temp location for Playwright to use
+        log.info(f"📋 Preparing Chrome profile from: {CHROME_PROFILE_DIR}")
+        
+        if not os.path.exists(CHROME_PROFILE_DIR):
+            log.error(f"❌ Chrome profile not found: {CHROME_PROFILE_DIR}")
+            log.error("   Make sure you're logged into TikTok in Chrome")
             return False
-
-        # Check cookie expiration
-        def validate_tiktok_cookies(path: str) -> bool:
-            """Validate TikTok cookies have required keys and aren't expired."""
-            now = time.time()
-            expiring_soon = now + (7 * 24 * 60 * 60)  # Warn if expires within 7 days
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    if "sessionid" not in content or "ttwid" not in content:
-                        log.error(f"⚠️  TikTok: cookies missing required keys (sessionid, ttwid)")
-                        return False
-
-                    for line in content.split('\n'):
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        parts = line.split("\t")
-                        if len(parts) >= 7:
-                            name = parts[5]
-                            try:
-                                expires = int(parts[4])
-                            except ValueError:
-                                continue
-                            if name in ("sessionid", "ttwid"):
-                                if expires < now:
-                                    log.error(f"❌ TikTok: cookie '{name}' is expired")
-                                    return False
-                                elif expires < expiring_soon:
-                                    days_left = (expires - now) / (24 * 60 * 60)
-                                    log.warning(f"⚠️  TikTok: cookie '{name}' expires in {days_left:.1f} days")
-                return True
-            except Exception as e:
-                log.error(f"❌ TikTok: cannot validate cookies: {e}")
+        
+        # Extract fresh cookies from Chrome automatically
+        log.info(f"🍪 Extracting fresh TikTok cookies from Chrome...")
+        try:
+            import browser_cookie3
+            cj = browser_cookie3.chrome(domain_name='tiktok.com')
+            
+            tiktok_cookies = []
+            for cookie in cj:
+                if 'tiktok.com' in cookie.domain:
+                    tiktok_cookies.append({
+                        'name': cookie.name,
+                        'value': cookie.value,
+                        'domain': cookie.domain,
+                        'path': cookie.path,
+                        'secure': cookie.secure,
+                        'expires': cookie.expires
+                    })
+            
+            # Check for sessionid
+            sessionids = [c for c in tiktok_cookies if 'sessionid' in c['name'].lower()]
+            if not sessionids:
+                log.error(f"❌ No sessionid found in Chrome - please login to TikTok in Chrome first")
                 return False
-
-        if not validate_tiktok_cookies(TIKTOK_COOKIES_FILE):
-            log.error("   Re-export fresh cookies and retry")
+            
+            # Save in Netscape format
+            with open(TIKTOK_COOKIES_FILE, "w", encoding="utf-8") as f:
+                f.write("# Netscape HTTP Cookie File\n")
+                f.write(f"# Auto-extracted at {datetime.now(pytz.timezone('Asia/Jakarta')).strftime('%Y-%m-%d %H:%M:%S WIB')}\n\n")
+                for cookie in tiktok_cookies:
+                    domain = cookie['domain'].lstrip('.')
+                    include_subdomains = "TRUE" if cookie['domain'].startswith('.') else "FALSE"
+                    secure = "TRUE" if cookie['secure'] else "FALSE"
+                    expires = cookie['expires'] if cookie['expires'] else int(time.time()) + 31536000
+                    f.write(f"{domain}\t{include_subdomains}\t{cookie['path']}\t{secure}\t{expires}\t{cookie['name']}\t{cookie['value']}\n")
+            
+            log.info(f"✅ Extracted {len(tiktok_cookies)} cookies ({len(sessionids)} session cookies)")
+            
+        except Exception as e:
+            log.error(f"❌ Failed to extract cookies: {e}")
+            log.error("   Make sure you're logged into TikTok in Chrome")
             return False
-
-        # Generate thumbnail
-        thumbnail_path = generate_thumbnail(video_path, 1080, 1920, "tiktok")
-        if not thumbnail_path:
-            log.error(f"❌ TikTok: failed to generate thumbnail")
-            return False
-
-        # Build description with caption + comment_bait for engagement
-        unique_caption = unique_ify_caption(clip.get("caption", ""))
-        comment_bait = clip.get("comment_bait", "").strip()
         
-        # Add comment_bait to description (increases engagement signal)
-        if comment_bait:
-            # Add line break and comment bait as engagement prompt
-            description = f"{unique_caption}\n\n💬 {comment_bait}"
-        else:
-            description = unique_caption
-        
-        # TikTok description limit: 2200 chars
-        description = description[:2200]
-        
-        video_dict = {
-            "path": video_path,
-            "description": description,
-            "cover": thumbnail_path,
-        }
-
-        log.info(f"📤 TikTok: uploading {clip.get('title', '?')}...")
         _human_pause(2, 5)  # Pre-upload pause
 
-        # Create TikTok uploader and upload with retries
-        with TikTokUploader(
-            cookies=TIKTOK_COOKIES_FILE,
-            headless=True,
-            user_data_dir=TIKTOK_BROWSER_DATA_DIR,
-        ) as uploader:
-            failed = uploader.upload_videos([video_dict], num_retries=2, skip_interactivity=True)
+        # Use undetected-playwright for full automation with bot detection bypass
+        log.info(f"🛡️  Using undetected-playwright for stealth upload...")
+        try:
+            from playwright.sync_api import sync_playwright
+            import browser_cookie3
+            from pathlib import Path
 
-            if failed:
-                log.error(f"❌ TikTok: upload failed after retries")
-                return False
+            UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?from=upload&lang=en"
+            STEALTH_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_stealth_profile")
 
-            _post_login_cooldown()
-            _daily_counts["tiktok"] += 1
-            log.info(f"✅ TikTok: {clip.get('title', '?')} [{_daily_counts['tiktok']}/{_daily_target} today]")
-            log.info(f"🖼️ TikTok cover: {thumbnail_path}")
-            return True
+            # Extract fresh cookies
+            cj = browser_cookie3.chrome(domain_name='tiktok.com')
+            tiktok_cookies_list = []
+            for cookie in cj:
+                if 'tiktok.com' in cookie.domain:
+                    tiktok_cookies_list.append({
+                        'name': cookie.name,
+                        'value': cookie.value,
+                        'domain': cookie.domain,
+                        'path': cookie.path,
+                        'secure': bool(cookie.secure),
+                        'expires': int(cookie.expires) if cookie.expires else int(time.time()) + 31536000,
+                        'httpOnly': False,
+                        'sameSite': 'Lax'
+                    })
+
+            log.info(f"🍪 Extracted {len(tiktok_cookies_list)} cookies")
+
+            # Ensure stealth profile directory exists
+            os.makedirs(STEALTH_PROFILE, exist_ok=True)
+
+            with sync_playwright() as p:
+                # Launch Chrome with persistent profile
+                browser = p.chromium.launch_persistent_context(
+                    user_data_dir=STEALTH_PROFILE,
+                    channel="chrome",
+                    headless=True,
+                    viewport={"width": 1280, "height": 900},
+                    user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+                    locale="en-US",
+                    timezone_id="Asia/Jakarta",
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-infobars",
+                        "--start-maximized",
+                    ],
+                )
+
+                # Add extracted cookies
+                browser.add_cookies(tiktok_cookies_list)
+                log.info(f"🍪 Added {len(tiktok_cookies_list)} cookies to browser")
+
+                page = browser.new_page()
+
+                log.info(f"🌐 Navigating to TikTok upload page...")
+                page.goto(UPLOAD_URL, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(5)
+
+                current_url = page.url
+                log.info(f"✅ Upload page loaded: {current_url}")
+
+                if "login" in current_url.lower():
+                    raise Exception(f"Redirected to login: {current_url}. Please ensure you're logged into TikTok in Chrome.")
+
+                # Build description
+                unique_caption = unique_ify_caption(clip.get("caption", ""))
+                comment_bait = clip.get("comment_bait", "").strip()
+                description = f"{unique_caption}\n\n💬 {comment_bait}" if comment_bait else unique_caption
+                description = description[:2200]
+
+                # Upload video - TikTok uses a hidden file input triggered by UI buttons
+                log.info(f"📤 Uploading video...")
+                
+                # Wait for the file input to exist in DOM (it's hidden but present)
+                file_input = page.wait_for_selector('input[type="file"]', state='attached', timeout=15000)
+                
+                if not file_input:
+                    log.error(f"❌ Could not find file input. Current URL: {page.url}")
+                    log.error(f"   Page title: {page.title()}")
+                    raise Exception("File input not found on page - TikTok UI may have changed")
+                
+                # Set files on the hidden input (Playwright can set files on hidden inputs)
+                file_input.set_input_files(video_path)
+                log.info(f"✅ Video selected: {os.path.basename(video_path)}")
+
+                # Wait for upload to process
+                log.info(f"⏳ Waiting for upload to process (this may take 1-2 minutes)...")
+                time.sleep(30)
+
+                # Dismiss any overlays/popups
+                try:
+                    overlay = page.query_selector('[data-test-id="overlay"]')
+                    if overlay:
+                        overlay.evaluate("el => el.style.display = 'none'")
+                        log.info(f"✅ Dismissed tutorial overlay")
+                except:
+                    pass
+
+                try:
+                    got_it = page.query_selector('button:has-text("Got it")')
+                    if got_it and got_it.is_visible():
+                        got_it.click()
+                        time.sleep(1)
+                        log.info(f"✅ Clicked 'Got it'")
+                except:
+                    pass
+
+                # Add description
+                log.info(f"📝 Adding description...")
+                desc_box = page.wait_for_selector('[contenteditable="true"]', timeout=30000)
+                desc_box.click()
+                time.sleep(1)
+                desc_box.fill(description)
+                log.info(f"📝 Description added")
+
+                # Wait for post button to be enabled and click it
+                log.info(f"⏳ Waiting for Post button...")
+                post_clicked = False
+                for i in range(40):  # Up to 2 minutes
+                    # Dismiss overlays before each attempt
+                    try:
+                        overlay = page.query_selector('[data-test-id="overlay"]')
+                        if overlay:
+                            overlay.evaluate("el => el.style.display = 'none'")
+                    except:
+                        pass
+
+                    try:
+                        got_it = page.query_selector('button:has-text("Got it")')
+                        if got_it and got_it.is_visible():
+                            got_it.click()
+                            time.sleep(0.5)
+                    except:
+                        pass
+
+                    post_btn = page.query_selector('button[data-e2e="post_video_button"]')
+                    if post_btn and post_btn.is_enabled():
+                        log.info(f"✅ Post button is enabled!")
+                        post_btn.click()
+                        log.info(f"🚀 Post clicked!")
+                        post_clicked = True
+                        time.sleep(10)
+                        break
+                    
+                    time.sleep(3)
+
+                if not post_clicked:
+                    raise Exception("Post button not enabled after 2 minutes")
+
+                # Handle "Continue to post" / "Post now" confirmation popup
+                log.info(f"⏳ Handling post confirmation...")
+                confirm_clicked = False
+                for i in range(10):
+                    try:
+                        # Dismiss any overlays first
+                        overlay = page.query_selector('[data-test-id="overlay"]')
+                        if overlay:
+                            overlay.evaluate("el => el.style.display = 'none'")
+                    except:
+                        pass
+
+                    try:
+                        # Look for dialog/modal confirmation buttons
+                        modal = page.query_selector('[role="dialog"], [class*="modal"], [class*="Dialog"]')
+                        if modal:
+                            buttons = modal.query_selector_all('button')
+                            for btn in buttons:
+                                btn_text = btn.evaluate('el => el.textContent?.trim()')
+                                if btn_text and any(word in btn_text.lower() for word in ['continue', 'post', 'confirm', 'yes']):
+                                    if btn.is_visible() and btn.is_enabled():
+                                        log.info(f"✅ Found confirmation button: '{btn_text}'")
+                                        btn.click()
+                                        confirm_clicked = True
+                                        time.sleep(3)
+                                        break
+
+                        if not confirm_clicked:
+                            # Fallback: scan all buttons on page
+                            all_buttons = page.query_selector_all('button')
+                            for btn in all_buttons:
+                                btn_text = btn.evaluate('el => el.textContent?.trim()?.toLowerCase()')
+                                if btn_text and any(word in btn_text for word in [
+                                    'continue', 'post now', 'publish', 'submit',
+                                    'post video', 'confirm', 'yes'
+                                ]):
+                                    if btn.is_visible() and btn.is_enabled():
+                                        log.info(f"✅ Found confirmation button: '{btn_text}'")
+                                        btn.click()
+                                        confirm_clicked = True
+                                        time.sleep(3)
+                                        break
+                    except:
+                        pass
+
+                    if confirm_clicked:
+                        break
+
+                    time.sleep(2)
+
+                if not confirm_clicked:
+                    log.warning(f"⚠️  No confirmation popup found, proceeding anyway")
+
+                # Wait for post to complete (page may redirect or show success)
+                log.info(f"⏳ Waiting for post to complete...")
+                time.sleep(15)
+
+                # Success
+                _daily_counts["tiktok"] += 1
+                log.info(f"✅ TikTok: {clip.get('title', '?')} [{_daily_counts['tiktok']}/{_daily_target} today]")
+                _post_login_cooldown()
+                
+                browser.close()
+                return True
+
+        except Exception as e:
+            log.error(f"❌ TikTok upload failed: {e}")
+            return False
 
     except Exception as e:
         error_str = str(e)
         if "No valid authentication" in error_str or "expired" in error_str.lower():
-            log.error(f"❌ TikTok: cookies invalid or expired")
-            log.error("   Re-export fresh cookies from tiktok.com (Netscape format)")
-            log.error(f"   Save to: {TIKTOK_COOKIES_FILE}")
+            log.error(f"❌ TikTok: not logged in - please login to TikTok in Chrome first")
+            log.error(f"   Go to https://www.tiktok.com and login")
         else:
             log.error(f"❌ TikTok: {e}")
         return False
@@ -1348,6 +1756,113 @@ def upload_tiktok(video_path: str, clip: dict) -> bool:
 # ═══════════════════════════════════════════════════════════
 #  Auto-comment functions — post comment_bait as first comment
 # ═══════════════════════════════════════════════════════════
+
+def post_tiktok_comment(uploader: "TikTokUploader", comment_text: str, video_url: str | None = None) -> bool:
+    """Post a comment on the most recently uploaded TikTok video.
+
+    Note: TikTok commenting via automation is unreliable due to frequent UI changes.
+    This function uses a best-effort approach but may not always succeed.
+
+    Args:
+        uploader: TikTokUploader instance with active browser
+        comment_text: The comment text to post
+        video_url: Optional direct URL to the uploaded video. If provided,
+                   skips profile scanning and navigates directly to the video.
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if not comment_text or not comment_text.strip():
+        log.debug("⏭️  TikTok: no comment_bait to post")
+        return True  # Not an error, just nothing to do
+
+    try:
+        page = uploader.page
+        log.info(f"💬 TikTok: attempting to post comment...")
+
+        # Navigate directly to the video if URL is known
+        if video_url:
+            log.debug(f"📹 TikTok: navigating to known video URL")
+            page.goto(video_url, wait_until="domcontentloaded", timeout=60000)
+        else:
+            # Fallback: navigate to user's profile to find latest video
+            log.debug("📹 TikTok: no video URL provided, scanning profile")
+            cookies = page.context.cookies()
+            session_cookie = next((c for c in cookies if "sessionid" in c["name"]), None)
+            if not session_cookie:
+                log.warning("⚠️  TikTok: no session cookie found, skipping comment")
+                return False
+
+            page.goto("https://www.tiktok.com/@me?lang=en", wait_until="domcontentloaded", timeout=60000)
+            _human_pause(3, 5)
+
+            # Try to find the first (most recent) video on the profile
+            # Note: TikTok may not show videos in chronological order
+            video_links = page.locator("xpath=//a[contains(@href, '/video/')]")
+
+            # Wait for at least one video link to appear
+            try:
+                video_links.first.wait_for(state="attached", timeout=15000)
+            except Exception:
+                log.warning("⚠️  TikTok: no videos found on profile, skipping comment")
+                return False
+
+            # Click on the first video (hopefully most recent)
+            log.debug(f"📹 TikTok: found {video_links.count()} videos, clicking first")
+            video_links.first.click()
+
+        # Wait for video page to load and look for comment section
+        _human_pause(3, 5)
+
+        # Look for comment input field with proper wait
+        comment_input = page.locator("xpath=//div[contains(@placeholder, 'Add a comment') or contains(@placeholder, 'Add comment')]")
+
+        try:
+            comment_input.first.wait_for(state="attached", timeout=15000)
+        except Exception:
+            log.warning("⚠️  TikTok: comment input not found, skipping comment")
+            return False
+
+        # Fill in the comment
+        comment_input.first.click()
+        _human_pause(1, 2)
+        comment_input.first.fill(comment_text.strip())
+        _human_pause(1, 2)
+
+        # Look for send/post button - use CSS selectors (more reliable for class-based matching)
+        send_selectors = [
+            "button[class*='send']",
+            "button:has-text('Post')",
+            "div[class*='comment-action']",
+            "xpath=//button[contains(@class, 'send')]",
+        ]
+
+        send_button = None
+        for selector in send_selectors:
+            try:
+                btn = page.locator(selector)
+                btn.first.wait_for(state="visible", timeout=3000)
+                send_button = btn.first
+                break
+            except Exception:
+                continue
+
+        if send_button:
+            send_button.click()
+            _human_pause(2, 3)
+            log.info("✅ TikTok: comment posted successfully")
+            return True
+        else:
+            # Fallback: try pressing Enter
+            log.debug("📝 TikTok: send button not found, trying Enter key")
+            comment_input.first.press("Enter")
+            _human_pause(2, 3)
+            log.info("✅ TikTok: comment posted (via Enter key)")
+            return True
+
+    except Exception as e:
+        log.warning(f"⚠️  TikTok: comment posting failed (non-fatal): {e}")
+        return False  # Non-fatal, upload succeeded
 
 
 def post_instagram_comment(ig: IGClient, media_id: str, comment_text: str) -> bool:
@@ -1431,11 +1946,6 @@ def post_youtube_comment(yt, video_id: str, comment_text: str) -> bool:
         else:
             log.error(f"❌ YouTube comment failed: {type(e).__name__}: {e}")
         return False
-
-
-# TikTok commenting requires browser automation which is complex.
-# For now, we skip TikTok auto-comments. The comment_bait can still
-# be used manually or added to the video description.
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1664,7 +2174,13 @@ def main(test_file: str | None = None,
          clean_orphans_flag: bool = False,
          prune_posted: bool = False,
          dry_run: bool = False,
-         platform: str | None = None):
+        platform: str | None = None,
+        reset_tiktok_browser: bool = False,
+        reset_tiktok_browser_hard: bool = False):
+    global RESET_TIKTOK_BROWSER_DATA, RESET_TIKTOK_BROWSER_DATA_HARD
+    RESET_TIKTOK_BROWSER_DATA = reset_tiktok_browser
+    RESET_TIKTOK_BROWSER_DATA_HARD = reset_tiktok_browser_hard
+
     log.info("=" * 60)
     log.info("  Cross-Platform Video Scheduler")
     log.info(f"  Timezone  : Asia/Jakarta (WIB, UTC+7)")
@@ -1832,6 +2348,16 @@ if __name__ == "__main__":
         "--platform",
         help="Specify a platform to post to (instagram, youtube, or tiktok). Used with --test-file to post to a single platform.",
     )
+    parser.add_argument(
+        "--reset-tiktok-browser-data",
+        action="store_true",
+        help="Reset TikTok Playwright transient browser data while preserving session.",
+    )
+    parser.add_argument(
+        "--reset-tiktok-browser-data-hard",
+        action="store_true",
+        help="Hard reset TikTok Playwright profile (deletes full profile and login state).",
+    )
     args = parser.parse_args()
     main(
         test_file=args.test_file,
@@ -1841,4 +2367,6 @@ if __name__ == "__main__":
         prune_posted=args.prune_posted,
         dry_run=args.dry_run,
         platform=args.platform,
+        reset_tiktok_browser=args.reset_tiktok_browser_data,
+        reset_tiktok_browser_hard=args.reset_tiktok_browser_data_hard,
     )

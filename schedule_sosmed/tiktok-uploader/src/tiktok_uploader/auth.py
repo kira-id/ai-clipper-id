@@ -4,12 +4,19 @@ from http import cookiejar
 from time import sleep, time
 from typing import Any, cast
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from tiktok_uploader import config, logger
 from tiktok_uploader.browsers import get_browser
 from tiktok_uploader.types import Cookie, cookie_from_dict
 from tiktok_uploader.utils import green
+
+# Get Chrome profile path for better error messages
+try:
+    from config import CHROME_PROFILE_DIR
+except ImportError:
+    CHROME_PROFILE_DIR = "your Chrome profile directory"
 
 
 class AuthBackend:
@@ -33,6 +40,7 @@ class AuthBackend:
         cookies: str | None = None,
         cookies_str: str | None = None,
         sessionid: str | None = None,
+        skip_auth_check: bool = False,  # NEW: skip auth check when using user_data_dir
     ):
         """
         Creates the authentication backend
@@ -42,6 +50,7 @@ class AuthBackend:
         - password -> the account's password
 
         - cookies -> a list of cookie dictionaries of cookies which is Playwright-compatible
+        - skip_auth_check -> if True, skip the initial auth check (used when cookies are in user_data_dir)
         """
         if (username and not password) or (password and not username):
             raise InsufficientAuth()
@@ -50,12 +59,14 @@ class AuthBackend:
         self.cookies_str = cookies_str
         self.cookies_list = list(cookies_list) if cookies_list else []
         self.sessionid = sessionid
+        self.skip_auth_check = skip_auth_check
         self.cookies = []
 
         has_cookie_input = bool(
             self.cookies_path or self.cookies_str or self.cookies_list or self.sessionid
         )
-        if not (has_cookie_input or (username and password)):
+        # Allow initialization without cookies if skip_auth_check is True
+        if not has_cookie_input and not (username and password) and not skip_auth_check:
             raise InsufficientAuth()
 
         self.username = username
@@ -74,6 +85,80 @@ class AuthBackend:
         """
         Authenticates the agent using the browser backend
         """
+        # If skip_auth_check is True, check if sessionid already exists in browser
+        if self.skip_auth_check:
+            existing_cookies = page.context.cookies()
+            has_sessionid = any(c["name"] == "sessionid" for c in existing_cookies)
+            
+            if has_sessionid:
+                logger.debug(green("Using existing session from browser profile"))
+                # Don't clear cookies - use the existing session
+                # Just navigate to upload page
+                try:
+                    page.goto(
+                        str(config.paths.upload),
+                        wait_until="domcontentloaded",
+                        timeout=config.explicit_wait * 1000,
+                    )
+                except PlaywrightError as nav_error:
+                    raise InsufficientAuth(
+                        f"Failed to navigate to TikTok upload page: {nav_error}"
+                    ) from nav_error
+                
+                # Check if we're redirected to login
+                current_url = page.url
+                if "login" in current_url or "explore" in current_url:
+                    raise InsufficientAuth(
+                        f"Not logged in: redirected to {current_url}. "
+                        "Please ensure you're logged into TikTok in your Chrome profile."
+                    )
+                
+                import re
+                expect(page).to_have_title(
+                    re.compile(r"TikTok"), timeout=config.explicit_wait * 1000
+                )
+                return page
+            else:
+                # No sessionid in current cookies, but maybe they're in the profile
+                # and will be loaded. Let's try navigating to upload page anyway
+                # without clearing cookies first.
+                logger.debug("No sessionid found yet, trying to navigate to upload page...")
+                try:
+                    page.goto(
+                        str(config.paths.upload),
+                        wait_until="domcontentloaded",
+                        timeout=config.explicit_wait * 1000,
+                    )
+                except PlaywrightError:
+                    pass  # Continue to check URL
+                
+                current_url = page.url
+                if "login" not in current_url and "explore" not in current_url:
+                    # Successfully loaded upload page - check if sessionid appeared
+                    new_cookies = page.context.cookies()
+                    if any(c["name"] == "sessionid" for c in new_cookies):
+                        logger.debug(green("Session loaded from profile after navigation"))
+                        import re
+                        expect(page).to_have_title(
+                            re.compile(r"TikTok"), timeout=config.explicit_wait * 1000
+                        )
+                        return page
+                    else:
+                        # On upload page but no sessionid - accept it anyway and let TikTok handle it
+                        logger.warning("⚠️  No sessionid cookie found - upload may fail")
+                        import re
+                        expect(page).to_have_title(
+                            re.compile(r"TikTok"), timeout=config.explicit_wait * 1000
+                        )
+                        return page
+                else:
+                    # Redirected to login - this means the profile doesn't have a valid TikTok session
+                    raise InsufficientAuth(
+                        f"Not logged in to TikTok: redirected to {current_url}. "
+                        f"Please open Chrome with profile '{CHROME_PROFILE_DIR}' and login to TikTok first."
+                    )
+
+        # Normal auth flow - resolve cookies from file/string/list
         if not self.cookies:
             self.cookies = self._resolve_cookies()
 
@@ -87,16 +172,33 @@ class AuthBackend:
 
         logger.debug(green("Authenticating browser with cookies"))
 
+        # Start from a clean cookie jar so stale profile cookies do not
+        # conflict with the freshly imported TikTok cookies.
+        try:
+            page.context.clear_cookies()
+        except Exception as exc:
+            logger.debug(f"Could not clear existing browser cookies before auth: {exc}")
+
         # Fix cookie keys for Playwright
         playwright_cookies = []
+        now_ts = int(time())
         for cookie in self.cookies:
             c = cookie.copy()
             if "expiry" in c:
+                # Skip expired cookies at injection time.
+                if isinstance(c["expiry"], int) and c["expiry"] <= now_ts:
+                    continue
                 c["expires"] = c.pop("expiry")
             # Playwright requires strict types for sameSite
             if "sameSite" in c:
                 if c["sameSite"] not in ["Strict", "Lax", "None"]:
                     c.pop("sameSite")
+
+            # Netscape cookie files may prefix the domain with "#HttpOnly_".
+            # Strip this marker before handing the cookie to Playwright.
+            domain = c.get("domain", "")
+            if isinstance(domain, str) and domain.startswith("#HttpOnly_"):
+                c["domain"] = domain[len("#HttpOnly_") :]
 
             # Fix domain: Playwright doesn't handle domains starting with a dot
             # Convert .tiktok.com -> tiktok.com
@@ -115,15 +217,101 @@ class AuthBackend:
         except Exception as e:
             logger.error(f"Failed to add cookies: {e}")
 
-        page.goto(str(config.paths.main))
+        try:
+            # Go straight to Creator upload where we post anyway.
+            # TikTok homepage may return challenge/blocked responses in automation.
+            page.goto(
+                str(config.paths.upload),
+                wait_until="domcontentloaded",
+                timeout=config.explicit_wait * 1000,
+            )
+        except PlaywrightError as nav_error:
+            raise InsufficientAuth(
+                "Authentication failed while opening TikTok creator upload page. "
+                "Your cookies may be stale, invalid, or challenged by TikTok. "
+                "Refresh tiktok_cookies.txt from an active logged-in browser session and retry. "
+                f"Original error: {nav_error}"
+            ) from nav_error
 
-        # Check if we are redirected to a login or explore page
+        # Check if we are redirected to an auth wall page.
         current_url = page.url
         if "login" in current_url or "explore" in current_url:
             # Check if we have the sessionid cookie
             cookies = page.context.cookies()
             has_sessionid = any(c["name"] == "sessionid" for c in cookies)
-            if not has_sessionid:
+            
+            if has_sessionid:
+                # Session cookie exists but we're still on login page - try recovery
+                logger.warning(
+                    f"Redirected to {current_url} despite having sessionid. "
+                    "Attempting recovery via main page..."
+                )
+                try:
+                    # Try navigating through main page to refresh session
+                    # This matches the recovery pattern in upload.py's _go_to_upload
+                    page.goto(
+                        str(config.paths.main),
+                        wait_until="domcontentloaded",
+                        timeout=config.explicit_wait * 1000,
+                    )
+                    
+                    # Wait a moment and try to dismiss any popups
+                    from time import sleep as time_sleep
+                    time_sleep(2)
+                    
+                    # Try to click "Got it" buttons if present
+                    import re as re_module
+                    try:
+                        got_it_buttons = [
+                            page.get_by_role("button", name=re_module.compile(r"^\s*got\s+it\s*!?\s*$", re_module.IGNORECASE)),
+                            page.locator("button:has-text('Got it')"),
+                        ]
+                        for locator in got_it_buttons:
+                            try:
+                                if locator.first.is_visible(timeout=1000):
+                                    locator.first.click(timeout=3000, force=True)
+                                    time_sleep(0.25)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    
+                    # Try to dismiss cookie banner
+                    try:
+                        cookie_banner_selector = f"{config.selectors.upload.cookies_banner.banner} >> {config.selectors.upload.cookies_banner.button} >> button"
+                        button = page.locator(cookie_banner_selector).first
+                        if button.is_visible(timeout=2000):
+                            button.click()
+                    except Exception:
+                        pass
+                    
+                    # Try upload page again
+                    page.goto(
+                        str(config.paths.upload),
+                        wait_until="domcontentloaded",
+                        timeout=config.explicit_wait * 1000,
+                    )
+                    
+                    # Check if recovery worked
+                    current_url = page.url
+                    if "login" in current_url or "explore" in current_url:
+                        logger.error(
+                            f"Recovery failed - still on {current_url} after main page navigation"
+                        )
+                        raise InsufficientAuth(
+                            f"Authentication failed: Redirected to {current_url}. "
+                            "Session may be invalid despite having sessionid cookie. "
+                            "Please refresh tiktok_cookies.txt from an active logged-in session."
+                        )
+                    else:
+                        logger.info("✅ Session recovery successful via main page navigation")
+                except PlaywrightError as recovery_error:
+                    logger.error(f"Session recovery failed: {recovery_error}")
+                    raise InsufficientAuth(
+                        f"Authentication failed: {current_url}. Recovery attempt failed: {recovery_error}. "
+                        "Please refresh tiktok_cookies.txt from an active logged-in session."
+                    )
+            else:
                 logger.error(
                     f"Redirected to {current_url} and sessionid cookie is missing"
                 )
@@ -184,7 +372,7 @@ class AuthBackend:
         return_cookies: list[Cookie] = []
         for line in lines:
             split = line.split("\t")
-            if len(split) < 6:
+            if len(split) < 7:
                 continue
 
             split = [x.strip() for x in split]
@@ -194,12 +382,26 @@ class AuthBackend:
             domain = split[0]
             path = split[2]
 
+            # Netscape format may encode HttpOnly as "#HttpOnly_" prefix.
+            # Keep the signal in the cookie but normalize the domain string.
+            http_only = False
+            if domain.startswith("#HttpOnly_"):
+                domain = domain[len("#HttpOnly_") :]
+                http_only = True
+
             cookie: Cookie = {
                 "name": name,
                 "value": value,
                 "domain": domain,
                 "path": path,
             }
+
+            # Netscape column #4 is the secure flag.
+            if split[3].upper() in ("TRUE", "FALSE"):
+                cookie["secure"] = split[3].upper() == "TRUE"
+
+            if http_only:
+                cookie["httpOnly"] = True
 
             try:
                 cookie["expiry"] = int(split[4])

@@ -1,4 +1,7 @@
 *.pt
+**/.chrome_profile
+**/tiktok_stealth_profile
+*.json
 music
 output
 .cache
