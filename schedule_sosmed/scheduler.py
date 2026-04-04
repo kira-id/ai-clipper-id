@@ -957,6 +957,7 @@ def get_youtube_client():
                 with open(YOUTUBE_TOKEN_FILE, "wb") as f:
                     pickle.dump(credentials, f)
                 log.info(f"✅ YouTube token refreshed")
+                _yt_channel_valid = False  # Re-validate with new token
                 _yt_client = googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
                 return _yt_client
             except Exception as e:
