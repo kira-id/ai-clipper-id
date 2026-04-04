@@ -433,6 +433,10 @@ YOUTUBE_SCOPES = [
     # "https://www.googleapis.com/auth/youtube",
 ]
 
+# Module-level YouTube client cache
+_yt_client = None
+_yt_channel_valid = False  # Track if channel validation passed this session
+
 FFMPEG_EXECUTABLE = FFMPEG_BIN
 FFPROBE_EXECUTABLE = FFPROBE_BIN
 
@@ -909,14 +913,22 @@ def get_ig_client() -> IGClient:
 def get_youtube_client():
     """
     Get authenticated YouTube client using explicit auth strategy (no fallback).
-    
+    Cached at module level to avoid rebuilding on every call.
+
     Priority:
-      1. Saved token with valid scopes
-      2. Refresh if expired
-      3. Fresh OAuth flow
+      1. Cached client (if already authenticated)
+      2. Saved token with valid scopes
+      3. Refresh if expired
+      4. Fresh OAuth flow
     """
+    global _yt_client, _yt_channel_valid
+
+    # Return cached client if available
+    if _yt_client is not None:
+        return _yt_client
+
     credentials = None
-    
+
     # Try loading saved token
     if os.path.exists(YOUTUBE_TOKEN_FILE):
         log.debug(f"📂  Loading saved YouTube token...")
@@ -945,7 +957,8 @@ def get_youtube_client():
                 with open(YOUTUBE_TOKEN_FILE, "wb") as f:
                     pickle.dump(credentials, f)
                 log.info(f"✅ YouTube token refreshed")
-                return googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+                _yt_client = googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+                return _yt_client
             except Exception as e:
                 log.warning(f"⚠️  Token refresh failed: {e}")
                 credentials = None
@@ -953,7 +966,8 @@ def get_youtube_client():
     # If token is valid and not expired, use it
     if credentials and credentials.valid:
         log.debug(f"🔐  Using existing valid YouTube token")
-        return googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+        _yt_client = googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+        return _yt_client
     
     # No valid credentials — explicit OAuth flow (not fallback)
     log.info(f"📋️  Starting fresh YouTube OAuth flow...")
@@ -965,13 +979,21 @@ def get_youtube_client():
         with open(YOUTUBE_TOKEN_FILE, "wb") as f:
             pickle.dump(credentials, f)
         log.info(f"✅ YouTube OAuth complete, token saved")
-        return googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+        _yt_client = googleapiclient.discovery.build("youtube", "v3", credentials=credentials)
+        return _yt_client
     except Exception as e:
         log.error(f"❌ YouTube OAuth failed: {e}")
         raise
 
 
 def validate_youtube_channel(yt) -> bool:
+    """Validate the YouTube channel (cached per session)."""
+    global _yt_channel_valid
+    
+    # Skip validation if already validated this session
+    if _yt_channel_valid:
+        return True
+    
     response = yt.channels().list(part="id,snippet", mine=True).execute()
     items = response.get("items", [])
     if not items:
@@ -996,6 +1018,7 @@ def validate_youtube_channel(yt) -> bool:
         log.error("   Delete yt_token.pickle, re-run auth, and login with the correct YouTube channel account.")
         return False
 
+    _yt_channel_valid = True
     return True
 
 
@@ -1287,7 +1310,7 @@ def upload_instagram(video_path: str, clip: dict) -> bool:
         media_id = None
         try:
             # Try to get the recently uploaded media
-            user_id = ig.user_id()
+            user_id = ig.user_id
             medias = ig.user_medias(user_id, amount=1)
             if medias:
                 media_id = str(medias[0].pk)
@@ -1367,7 +1390,7 @@ def upload_youtube(video_path: str, clip: dict) -> bool:
         _human_pause(2, 5)  # Pre-upload pause
 
         req = yt.videos().insert(
-            part="snippet,status,recordingDetails",
+            part="snippet,status",
             body={
                 "snippet": {
                     "title": title,
@@ -1383,9 +1406,6 @@ def upload_youtube(video_path: str, clip: dict) -> bool:
                     "license": YOUTUBE_LICENSE,
                     "embeddable": YOUTUBE_EMBEDDABLE,
                     "publicStatsViewable": YOUTUBE_PUBLIC_STATS_VIEWABLE,
-                },
-                "recordingDetails": {
-                    "recordingDate": datetime.now(timezone.utc).replace(microsecond=0).isoformat()
                 },
             },
             media_body=MediaFileUpload(
@@ -1420,11 +1440,15 @@ def upload_youtube(video_path: str, clip: dict) -> bool:
         return True
     except Exception as e:
         error_str = str(e)
-        if "quotaExceeded" in error_str or "403" in error_str:
-            log.error("❌ YouTube: Daily API quota exceeded")
+        if "quotaExceeded" in error_str or ("403" in error_str and "insufficientPermissions" in error_str):
+            log.error("❌ YouTube: Daily API quota exceeded for comments")
             log.error("   YouTube API has 10,000 units/day; video uploads = 1,600 units each (~6/day max)")
             log.error("   Quota resets at midnight PT")
             log.error("   Check: https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas")
+            log.error("   Tip: Apply for quota increase or wait for reset")
+        elif "403" in error_str:
+            log.error(f"❌ YouTube: 403 Forbidden - {e}")
+            log.error("   This may be a permissions issue. Try re-authenticating.")
         else:
             log.error(f"❌ YouTube: {e}")
         return False
@@ -1938,8 +1962,14 @@ def post_youtube_comment(yt, video_id: str, comment_text: str) -> bool:
         return True
     except Exception as e:
         error_str = str(e)
-        if "quotaExceeded" in error_str or "403" in error_str:
+        if "quotaExceeded" in error_str or ("403" in error_str and "insufficientPermissions" in error_str):
             log.error("❌ YouTube: Daily API quota exceeded for comments")
+            log.error("   Quota resets at midnight PT")
+            log.error("   Check: https://console.cloud.google.com/apis/api/youtube.googleapis.com/quotas")
+            log.error("   Tip: Apply for quota increase or wait for reset")
+        elif "403" in error_str:
+            log.error(f"❌ YouTube: 403 Forbidden - {e}")
+            log.error("   This may be a permissions issue. Try re-authenticating.")
         elif "commentsDisabled" in error_str or "comments disabled" in error_str.lower():
             log.warning(f"⚠️  YouTube: comments are disabled on this video")
             return True  # Not our fault, video has comments disabled
