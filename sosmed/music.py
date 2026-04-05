@@ -215,8 +215,8 @@ def match_music_to_clip(
         f"Topic: {clip.get('topic', '')}\n"
         f"Hook: {clip.get('hook', '')}\n"
         f"Caption: {clip.get('caption', '')}\n"
-        f"Scores — hook: {clip.get('score_hook', 0)}, "
-        f"emotional: {clip.get('score_emotional_payoff', 0)}, "
+        f"Scores — emotion: {clip.get('score_emotion', 0)}, "
+        f"hook: {clip.get('score_hook', 0)}, "
         f"retention: {clip.get('score_retention', 0)}"
     )
 
@@ -284,8 +284,8 @@ def match_music_batch(
             f"title=\"{c.get('title', '')}\", "
             f"topic=\"{c.get('topic', '')}\", "
             f"hook=\"{c.get('hook', '')}\", "
-            f"scores(hook={c.get('score_hook', 0)}, "
-            f"emotional={c.get('score_emotional_payoff', 0)})"
+            f"scores(emotion={c.get('score_emotion', 0)}, "
+            f"hook={c.get('score_hook', 0)})"
         )
 
     system = (

@@ -22,6 +22,7 @@ from .utils import (
     save_clips_to_disk, load_clips_with_internal_fields
 )
 from .smart_clip_boundaries import smart_adjust_clip_boundaries
+from .audio_energy import analyze_audio_energy
 from .config import get_defaults, load_config, get_cta_settings
 
 
@@ -315,17 +316,16 @@ def main() -> None:
         print()
 
         # Summary table
-        print(f"{BOLD}{'#':<4} {'Score':<6} {'H/I/R/E/C':<18} {'Start':>7} {'End':>7} {'Dur':>5}  Topic{RESET}")
+        print(f"{BOLD}{'#':<4} {'Score':<6} {'E/H/R/P':<16} {'Start':>7} {'End':>7} {'Dur':>5}  Topic{RESET}")
         print("─" * 90)
         for c in clips:
             d = c["end"] - c["start"]
+            se = c.get("score_emotion", "?")
             sh = c.get("score_hook", "?")
-            si = c.get("score_insight_density", "?")
             sr = c.get("score_retention", "?")
-            se = c.get("score_emotional_payoff", "?")
-            sc = c.get("score_clarity", "?")
+            sp = c.get("score_personality", "?")
             print(f"  {c['rank']:<3} {c.get('clip_score', '?'):<6} "
-                  f"{sh}/{si}/{sr}/{se}/{sc}  "
+                  f"{se}/{sh}/{sr}/{sp}  "
                   f"{c['start']:>7.1f} {c['end']:>7.1f} {d:>4.0f}s  {c.get('topic', c['title'])}")
         print()
 
@@ -506,6 +506,9 @@ def main() -> None:
         log("ERROR", "All segments filtered out. Try a different whisper model or looser filters.")
         sys.exit(1)
 
+    # ── 2b. Audio energy analysis ─────────────────────────────────────────
+    energy_events = analyze_audio_energy(str(video))
+
     # ── 3. LLM analysis ─────────────────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
     clips_cache_file = output_dir / "clips.json"
@@ -534,6 +537,7 @@ def main() -> None:
             chunk_duration=args.chunk_duration,
             chunk_overlap=args.chunk_overlap,
             raw_clips_cache_file=raw_clips_cache_file,
+            energy_events=energy_events,
         )
         _ensure_filenames(clips)
 
@@ -574,17 +578,16 @@ def main() -> None:
     log("OK", f"Metadata saved early → {meta}")
 
     # Summary table
-    print(f"\n{BOLD}{'#':<4} {'Score':<6} {'H/I/R/E/C':<18} {'Start':>7} {'End':>7} {'Dur':>5}  Topic{RESET}")
+    print(f"\n{BOLD}{'#':<4} {'Score':<6} {'E/H/R/P':<16} {'Start':>7} {'End':>7} {'Dur':>5}  Topic{RESET}")
     print("─" * 90)
     for c in clips:
         d = c["end"] - c["start"]
+        se = c.get("score_emotion", "?")
         sh = c.get("score_hook", "?")
-        si = c.get("score_insight_density", "?")
         sr = c.get("score_retention", "?")
-        se = c.get("score_emotional_payoff", "?")
-        sc = c.get("score_clarity", "?")
+        sp = c.get("score_personality", "?")
         print(f"  {c['rank']:<3} {c.get('clip_score', '?'):<6} "
-              f"{sh}/{si}/{sr}/{se}/{sc}  "
+              f"{se}/{sh}/{sr}/{sp}  "
               f"{c['start']:>7.1f} {c['end']:>7.1f} {d:>4.0f}s  {c.get('topic', c['title'])}")
     print()
 

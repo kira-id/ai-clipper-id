@@ -22,6 +22,7 @@ from .extraction import extract_clips
 from .postprocess import postprocess_clips
 from .subtitles import generate_ass_subtitles, generate_title_overlay, get_clip_words
 from .utils import log, tighten_clip_boundaries
+from .audio_energy import analyze_audio_energy
 
 __version__ = "0.3.0"
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "get_clip_words",
     "log",
     "tighten_clip_boundaries",
+    "analyze_audio_energy",
 ]

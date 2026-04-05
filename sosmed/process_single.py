@@ -59,11 +59,10 @@ def _build_full_video_clip(
         "hook": "",
         "closing_line": "",
         "comment_bait": "",
+        "score_emotion": 100,
         "score_hook": 100,
-        "score_insight_density": 100,
         "score_retention": 100,
-        "score_emotional_payoff": 100,
-        "score_clarity": 100,
+        "score_personality": 100,
         "clip_score": 100,
     }
 

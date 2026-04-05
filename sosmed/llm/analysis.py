@@ -12,21 +12,43 @@ from ..utils import log, SYSTEM_PROMPT, MAX_CLIPS_HARD_LIMIT
 from .backends import call_llm
 
 
-def _build_transcript_text(segments: list[dict[str, Any]]) -> str:
+def _build_transcript_text(
+    segments: list[dict[str, Any]],
+    energy_events: list[dict[str, Any]] | None = None,
+) -> str:
     """
-    Build transcript with sentence structure hints for better clip selection.
-    
-    Format: [start-end] text | gap_to_next
-    - Shows gap (in seconds) to next segment to help LLM identify natural pauses
+    Build transcript with sentence structure hints and audio energy markers.
+
+    Format: [start-end] text [marker] [gap]
     - Gaps >1.0s marked with [PAUSE] to indicate sentence boundaries
+    - Energy spikes/high moments annotated with [ENERGY SPIKE] / [HIGH ENERGY]
     """
+    # Pre-sort energy events by start time for efficient lookup via pointer scan
+    sorted_energy = sorted(energy_events, key=lambda e: e["start"]) if energy_events else []
+
     lines: list[str] = []
+    ev_ptr = 0  # pointer into sorted_energy ��� advances as segments progress
     for i, s in enumerate(segments):
-        # Use integer seconds when possible to save chars
         st = f"{s['start']:.0f}" if s['start'] == int(s['start']) else f"{s['start']:.1f}"
         en = f"{s['end']:.0f}" if s['end'] == int(s['end']) else f"{s['end']:.1f}"
-        
-        # Calculate gap to next segment (for sentence boundary detection)
+
+        # Check for energy events overlapping this segment (scan forward only)
+        energy_marker = ""
+        if sorted_energy:
+            # Advance pointer past events that end before this segment starts
+            while ev_ptr < len(sorted_energy) and sorted_energy[ev_ptr]["end"] <= s["start"]:
+                ev_ptr += 1
+            # Check events from pointer onward (they start before or during this segment)
+            for j in range(ev_ptr, len(sorted_energy)):
+                ev = sorted_energy[j]
+                if ev["start"] >= s["end"]:
+                    break  # all remaining events are past this segment
+                # Overlap confirmed
+                label = "🔥 ENERGY SPIKE" if ev["kind"] == "spike" else "⚡ HIGH ENERGY"
+                energy_marker = f" [{label}]"
+                break
+
+        # Gap to next segment for sentence boundary detection
         gap_marker = ""
         if i < len(segments) - 1:
             gap = segments[i + 1]["start"] - s["end"]
@@ -34,8 +56,8 @@ def _build_transcript_text(segments: list[dict[str, Any]]) -> str:
                 gap_marker = f" [PAUSE {gap:.1f}s]"
             elif gap >= 0.5:
                 gap_marker = f" [gap {gap:.2f}s]"
-        
-        lines.append(f"[{st}-{en}]{s['text']}{gap_marker}")
+
+        lines.append(f"[{st}-{en}]{s['text']}{energy_marker}{gap_marker}")
     return "\n".join(lines)
 
 
@@ -100,43 +122,36 @@ def _build_user_prompt(
 
 def _compute_clip_score(c: dict[str, Any]) -> float:
     """
-    Compute clip_score using the educational virality weighting.
-    
-    If the clip has an existing valid clip_score and all new dimension scores 
-    are missing (legacy format), preserve the original score.
+    Compute clip_score using emotion-first gaming weighting.
+
+    Weights: emotion 40%, hook 30%, retention 20%, personality 10%.
+    Falls back to legacy field names if new ones are missing.
     """
     scores = _normalize_score_fields(c)
+    emotion = scores["score_emotion"]
     hook = scores["score_hook"]
-    insight_density = scores["score_insight_density"]
     retention = scores["score_retention"]
-    emotional_payoff = scores["score_emotional_payoff"]
-    clarity = scores["score_clarity"]
+    personality = scores["score_personality"]
 
-    # If all new scores ended up coming from legacy mapping and original clip_score exists,
-    # prefer the original (legacy format clips)
+    # If all new scores are missing but original clip_score exists, preserve it
     has_original_score = "clip_score" in c and isinstance(c.get("clip_score"), (int, float))
     has_new_fields = any(c.get(f) is not None for f in [
-        "score_hook", "score_insight_density", "score_retention",
-        "score_emotional_payoff", "score_clarity"
+        "score_emotion", "score_hook", "score_retention", "score_personality"
     ])
 
     if has_original_score and not has_new_fields and c["clip_score"] > 0:
-        # Legacy format clip with original score - return it
         return float(c["clip_score"])
 
-    total = hook + insight_density + retention + emotional_payoff + clarity
+    total = emotion + hook + retention + personality
     if total > 0:
         return round(
-            hook * 0.30
-            + insight_density * 0.25
+            emotion * 0.40
+            + hook * 0.30
             + retention * 0.20
-            + emotional_payoff * 0.15
-            + clarity * 0.10,
+            + personality * 0.10,
             1,
         )
 
-    # No scores at all — the LLM returned this clip without scoring fields.
-    # The LLM chose it, so assign a default passing score.
     return 70.0
 
 
@@ -153,30 +168,50 @@ def _normalize_score_fields(c: dict[str, Any]) -> dict[str, int]:
     """
     Normalize per-dimension score fields to keep output stable.
     Falls back to legacy score fields if new ones are missing.
-    """
-    # Try new field names first
-    hook = _to_score(c.get("score_hook"))
-    insight_density = _to_score(c.get("score_insight_density"))
-    retention = _to_score(c.get("score_retention"))
-    emotional_payoff = _to_score(c.get("score_emotional_payoff"))
-    clarity = _to_score(c.get("score_clarity"))
-    
-    # If all new fields are missing, try legacy fields
-    if hook == 0 and insight_density == 0 and retention == 0 and emotional_payoff == 0 and clarity == 0:
-        # Map legacy fields to new ones
-        hook = _to_score(c.get("score_newsworthy", c.get("score_shareability", 0)))  # newsworthy acts as hook
-        insight_density = _to_score(c.get("score_informative", c.get("score_educational", 0)))
-        retention = _to_score(c.get("score_energy", 0))  # energy acts as retention
-        emotional_payoff = _to_score(c.get("score_entertainment", 0))
-        clarity = _to_score(c.get("score_easy", 0))
 
-    return {
-        "score_hook": hook,
-        "score_insight_density": insight_density,
-        "score_retention": retention,
-        "score_emotional_payoff": emotional_payoff,
-        "score_clarity": clarity,
-    }
+    New format: score_emotion, score_hook, score_retention, score_personality
+    Old format: score_hook, score_insight_density, score_retention,
+                score_emotional_payoff, score_clarity
+    Very old:   score_newsworthy, score_informative, score_energy,
+                score_entertainment, score_easy
+    """
+    # Detect which format the clip uses by checking for format-specific keys
+    has_new = "score_emotion" in c or "score_personality" in c
+    has_old = "score_emotional_payoff" in c or "score_insight_density" in c or "score_clarity" in c
+    has_very_old = "score_newsworthy" in c or "score_entertainment" in c or "score_easy" in c
+
+    if has_new:
+        # New gaming format — use directly
+        return {
+            "score_emotion": _to_score(c.get("score_emotion")),
+            "score_hook": _to_score(c.get("score_hook")),
+            "score_retention": _to_score(c.get("score_retention")),
+            "score_personality": _to_score(c.get("score_personality")),
+        }
+    elif has_old:
+        # Old educational format — map to gaming scores
+        return {
+            "score_emotion": _to_score(c.get("score_emotional_payoff")),
+            "score_hook": _to_score(c.get("score_hook")),
+            "score_retention": _to_score(c.get("score_retention")),
+            "score_personality": _to_score(c.get("score_insight_density", c.get("score_clarity"))),
+        }
+    elif has_very_old:
+        # Very old format
+        return {
+            "score_emotion": _to_score(c.get("score_entertainment")),
+            "score_hook": _to_score(c.get("score_newsworthy", c.get("score_shareability"))),
+            "score_retention": _to_score(c.get("score_energy")),
+            "score_personality": _to_score(c.get("score_easy", c.get("score_informative"))),
+        }
+    else:
+        # Unknown / no score fields — try common names as best effort
+        return {
+            "score_emotion": _to_score(c.get("score_emotion")),
+            "score_hook": _to_score(c.get("score_hook")),
+            "score_retention": _to_score(c.get("score_retention")),
+            "score_personality": _to_score(c.get("score_personality")),
+        }
 
 
 # Titles/topics that indicate non-viral content (intros, outros, etc.)
@@ -223,58 +258,57 @@ def _validate_clips(
             score = max(0, score - 25)
         c["_score"] = score
         scored_clips.append(c)
-    # Tiebreaker: score_hook (stop-scrolling power is #1 virality predictor)
-    scored_clips.sort(key=lambda x: (-x["_score"], -int(x.get("score_hook", 0) or 0)))
+    # Tiebreaker: score_emotion (emotional intensity is #1 virality predictor for gaming)
+    scored_clips.sort(key=lambda x: (-x["_score"], -int(x.get("score_emotion", 0) or 0)))
 
     for c in scored_clips:
         s, e = float(c["start"]), float(c["end"])
         dur = e - s
         title = c.get("title", "?")
-        
+
         # Duration check
         if dur < min_dur or dur > max_dur:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: duration {dur:.0f}s outside {min_dur}-{max_dur}s")
             continue
-        
+
         # Video duration check
         if video_duration and e > video_duration + 2:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: end exceeds video duration {video_duration:.0f}s")
             continue
-        
+
         score = c["_score"]
-        
+
         # Minimum score check
         if score < min_score:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: score {score:.1f} < {min_score}")
             continue
-        
+
         # VIRAL REQUIREMENTS: Enforce strict score floors
-        hook_score = int(c.get("score_hook", 0) or 0)
+        emotion_score = int(c.get("score_emotion", 0) or 0)
         retention_score = int(c.get("score_retention", 0) or 0)
-        
-        # No weak hooks allowed (must be ≥60)
-        if hook_score < 60:
-            log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: hook score {hook_score} < 60 (weak hook)")
+
+        # Emotion must be engaging (≥60)
+        if emotion_score < 60:
+            log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: emotion score {emotion_score} < 60 (flat)")
             continue
-        
+
         # Must have strong ending (retention ≥50)
         if retention_score < 50:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: retention score {retention_score} < 50 (weak ending)")
             continue
-        
+
         # At least two scores must be ≥70 (viral-tier quality)
         all_scores = [
-            hook_score,
-            int(c.get("score_insight_density", 0) or 0),
+            emotion_score,
+            int(c.get("score_hook", 0) or 0),
             retention_score,
-            int(c.get("score_emotional_payoff", 0) or 0),
-            int(c.get("score_clarity", 0) or 0),
+            int(c.get("score_personality", 0) or 0),
         ]
-        high_scores = sum(1 for score in all_scores if score >= 70)
+        high_scores = sum(1 for s_val in all_scores if s_val >= 70)
         if high_scores < 2:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: only {high_scores} scores ≥70 (need 2+)")
             continue
-        
+
         # Normalize score fields for output
         normalized = _normalize_score_fields(c)
         
@@ -314,15 +348,18 @@ def _validate_clips(
             "score_informative",
             "score_energy",
             "score_newsworthy",
+            "score_insight_density",
+            "score_emotional_payoff",
+            "score_clarity",
         ):
             c.pop(legacy, None)
-        
+
         valid.append(c)
         if len(valid) >= max_clips:
             break
 
-    # Re-rank by clip_score, tiebreak by hook strength (strongest virality signal)
-    valid.sort(key=lambda x: (-x.get("clip_score", 0), -int(x.get("score_hook", 0) or 0)))
+    # Re-rank by clip_score, tiebreak by emotion (strongest virality signal for gaming)
+    valid.sort(key=lambda x: (-x.get("clip_score", 0), -int(x.get("score_emotion", 0) or 0)))
     for i, c in enumerate(valid, 1):
         c["rank"] = i
 
@@ -431,6 +468,7 @@ def find_clips(
     chunk_duration: float = 480.0,
     chunk_overlap: float = 60.0,
     raw_clips_cache_file: str | Path | None = None,
+    energy_events: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Ask LLM to find ALL engaging clips (up to *max_clips*).
@@ -479,7 +517,7 @@ def find_clips(
             clips_per_chunk = max(10, math.ceil(max_clips / max(n_chunks, 1) * 1.5))
             clips_per_chunk = min(clips_per_chunk, max_clips)
 
-            transcript = _build_transcript_text(chunk)
+            transcript = _build_transcript_text(chunk, energy_events)
             chunk_info = ""
             if n_chunks > 1:
                 chunk_info = (
