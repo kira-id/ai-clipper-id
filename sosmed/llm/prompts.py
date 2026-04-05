@@ -13,7 +13,7 @@ Tasks:
 
 Field requirements (in this order):
 - reason: 1-2 sentences explaining why this full-video clip is compelling or worth watching
-- title: Max 8 words. No jargon. Non-technical audience. Apply jargon translation (LLM → "otak AI", etc.). Use viral formula (Number+Outcome, Expose Lie, Secret, Comparison, Personal Stakes, or How+Wonder).
+- title: Max 8 words. No jargon. Non-technical audience. Translate technical terms to plain English (e.g., "large language model" → "AI brain", "fine-tuning" → "AI training"). Use viral formula (Number+Outcome, Expose Lie, Secret, Comparison, Personal Stakes, or How+Wonder).
 - topic: one clear sentence describing the core idea or debate
 - caption: 4-part structure (hook line → insight → CTA → hashtags). Total max 280 chars.
 - comment_bait: Single opinion/experience question to drive comments. Under 15 words. NOT a knowledge quiz.
@@ -21,17 +21,18 @@ Field requirements (in this order):
 - closing_line: The EXACT last words from the transcript — word-for-word. Must be a strong ending.
 
 Language rules:
-- If the transcript is in Indonesian, write reason, title, topic, caption, comment_bait, hook, and closing_line in Indonesian.
+- Write all fields (reason, title, topic, caption, comment_bait, hook, closing_line) in English
+- If the transcript is in a different language, translate concepts to English while maintaining meaning
 - Do not use the filename or generic placeholders as metadata.
 - Do not invent facts not supported by the transcript.
 
 Return ONLY valid JSON array, no other text.""",
 
-    "Translate to Indonesian": """Given clips data in JSON format, perform the following:
+    "Translate to English": """Given clips data in JSON format, perform the following:
 
 1. For each clip, analyze the language of the fields: reason, topic, caption, hook, closing_line, comment_bait
-2. If any of these fields are NOT in Indonesian (Bahasa Indonesia), translate them to Indonesian
-3. If they are already in Indonesian, keep them unchanged
+2. If any of these fields are NOT in English, translate them to English
+3. If they are already in English, keep them unchanged
 4. Preserve the meaning, tone, and marketing appeal during translation
 5. Keep all other fields unchanged (title, scores, timing, metadata)
 6. Return the same JSON array with only the translated/updated fields
@@ -39,10 +40,10 @@ Return ONLY valid JSON array, no other text.""",
 IMPORTANT: Do NOT translate the "title" field — keep it exactly as-is.
 
 Example input:
-[{"title": "How to cook rice", "topic": "Cooking Tips", "caption": "Learn fast!", "rank": 1, ...}]
+[{"title": "How to cook rice", "topic": "Tips Memasak", "caption": "Pelajari dengan cepat!", "rank": 1, ...}]
 
 Example output:
-[{"title": "How to cook rice", "topic": "Tips Memasak", "caption": "Pelajari dengan cepat!", "rank": 1, ...}]
+[{"title": "How to cook rice", "topic": "Cooking Tips", "caption": "Learn fast!", "rank": 1, ...}]
 
 Return ONLY valid JSON array, no other text.""",
 
@@ -87,75 +88,53 @@ Return ONLY valid JSON array with fixed clips, no other text.""",
 4. Re-rank remaining clips by clip_score (highest first)
 
 Return ONLY a valid JSON array of the kept and improved clips, no other text.""",
-    "Translate Subtitle Phrases": """Given subtitle phrases in JSON format, translate each phrase to Indonesian (Bahasa Indonesia) AND add proper punctuation.
+    "Translate Subtitle Phrases": """Given subtitle phrases in JSON format, translate each phrase to English AND add proper punctuation.
 
 Input format: [{"id": 0, "text": "some phrase", "start": 0.5, "end": 2.0}, ...]
 
 Rules:
-- Translate the "text" field to Indonesian. If text is already in Indonesian, keep it unchanged.
+- Translate the "text" field to English. If text is already in English, keep it unchanged.
 - Add natural punctuation: periods (.), commas (,), question marks (?), exclamation marks (!) as appropriate for spoken content.
 - Keep the word count roughly the same — punctuation marks are fine but do NOT add or remove words.
 - Keep "id", "start", "end" fields exactly unchanged.
-- Maintain natural conversational Indonesian.
+- Maintain natural conversational English.
 - Keep the exact same number of items in the output array.
 
 Example:
 Input:  [{"id": 0, "text": "oh itu menarik sekali", "start": 0.0, "end": 1.5}]
-Output: [{"id": 0, "text": "Oh, itu menarik sekali.", "start": 0.0, "end": 1.5}]
+Output: [{"id": 0, "text": "Oh, that's really interesting.", "start": 0.0, "end": 1.5}]
 
 Return ONLY a JSON array with the exact same structure.
 """,
 
-    "Fix and Translate Subtitle Phrases": """Given subtitle phrases from Whisper transcription in JSON format, FIX transcription errors AND translate to Indonesian (Bahasa Indonesia).
+    "Fix and Translate Subtitle Phrases": """Given subtitle phrases from Whisper transcription in JSON format, FIX transcription errors AND translate to English.
 
 Whisper often makes mistakes like:
-- Wrong words due to similar sounds (e.g., "AI" heard as "ai", "email" as "imei")
+- Wrong words due to similar sounds (e.g., "I" heard as "eye", "their" as "there")
 - Missing punctuation
 - Incorrect proper nouns (names, brands, technical terms)
 - Run-on sentences without breaks
-- Misheard Indonesian words (e.g., "nggak" as "enggak", "buat" as "buah")
+- Misheard words (e.g., "gonna" as "going to", "dunno" as "don't know")
 
 Input format: [{"id": 0, "text": "some phrase", "start": 0.5, "end": 2.0}, ...]
 
 Your tasks:
 1. FIX any transcription errors based on context
-2. Translate the corrected text to Indonesian (if not already Indonesian)
+2. Translate the corrected text to English (if not already English)
 3. Add natural punctuation: periods (.), commas (,), question marks (?), exclamation marks (!)
 4. Keep the meaning and tone natural and conversational
 
 Rules:
 - Keep "id", "start", "end" fields exactly unchanged
-- Maintain roughly the same word count — you can adjust word boundaries for natural Indonesian but don't add/remove entire concepts
+- Maintain roughly the same word count — you can adjust word boundaries for natural English but don't add/remove entire concepts
 - Fix proper nouns, technical terms, and brand names based on context
 - Add appropriate punctuation for spoken content
 - Keep the exact same number of items in the output array
-- If text is already correct Indonesian, just add punctuation and return unchanged
-
-JARGON SIMPLIFICATION (mandatory — translate technical terms to plain Indonesian in subtitles):
-- "large language model" / "LLM" → "model AI" atau "otak AI"
-- "RAG" / "Retrieval Augmented Generation" → "AI yang baca dokumen"
-- "fine-tuning" → "melatih AI"
-- "embeddings" / "vector" → "representasi data"
-- "prompt engineering" → "cara ngomong ke AI"
-- "token" / "tokenizer" → "satuan teks"
-- "context window" → "memori AI"
-- "hallucination" → "AI yang ngarang"
-- "inference" → "proses AI berpikir"
-- "AI agent" → "AI yang bisa kerja sendiri"
-- "machine learning" → "mesin yang belajar"
-- "neural network" → "jaringan saraf AI"
-- "GPU" → "prosesor AI"
-- "API" → "penghubung program"
-- If a term is not listed: explain what it DOES, not what it IS. Keep it to 1-2 words max.
-- Do NOT over-explain: subtitle must stay natural speech. Just swap the term, keep the sentence.
+- If text is already correct English, just add punctuation and return unchanged
 
 Example:
-Input:  [{"id": 0, "text": "jadi gini ya ai tuh sekarang canggih banget", "start": 0.0, "end": 2.5}]
-Output: [{"id": 0, "text": "Jadi gini, ya. AI tuh sekarang canggih banget.", "start": 0.0, "end": 2.5}]
-
-Example with errors:
-Input:  [{"id": 0, "text": "kita bisa pakai gpt untuk ngerjain tugas", "start": 0.0, "end": 2.0}]
-Output: [{"id": 0, "text": "Kita bisa pakai GPT untuk ngerjain tugas.", "start": 0.0, "end": 2.0}]
+Input:  [{"id": 0, "text": "so basically ai is like really powerful now", "start": 0.0, "end": 2.5}]
+Output: [{"id": 0, "text": "So basically, AI is like really powerful now.", "start": 0.0, "end": 2.5}]
 
 Return ONLY a JSON array with the exact same structure.
 """,}
@@ -168,7 +147,7 @@ def get_prompt(section_name: str) -> str:
     Args:
         section_name: One of:
             - "Generate Single Clip Metadata"
-            - "Translate to Indonesian"
+            - "Translate to English"
             - "Fix Mismatched Caption/Topic"
             - "Improve and Deduplicate Clips"
             - "Translate Subtitle Phrases"

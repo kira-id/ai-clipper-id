@@ -1,5 +1,5 @@
 """
-AI Video Clipper — Indonesian-optimized video clip extraction.
+AI Video Clipper — English-optimized video clip extraction.
 
 Transcribes video with faster-whisper, filters noise/fillers, uses LLM to
 identify engaging clips, then extracts them in parallel with ffmpeg.

@@ -356,7 +356,7 @@ The transcript has audio energy markers: [🔥 ENERGY SPIKE] = sudden loudness (
 
 Clip duration: {min_dur}–{max_dur} seconds. Maximum {max_clips} clips. Output JSON array only.
 
-LANGUAGE: ALL text fields MUST be in Bahasa Indonesia.
+LANGUAGE: ALL text fields MUST be in English.
 
 ---
 
@@ -366,7 +366,7 @@ CLIP BOUNDARIES (NON-NEGOTIABLE)
 
 **End**: Must end at a natural stopping point — after the reaction lands, at a sentence boundary, or at a satisfying punchline. Use [PAUSE] markers as natural endpoints. NEVER cut mid-sentence or mid-thought. The clip must feel COMPLETE.
 
-**NEVER start with:** greetings, filler words ("jadi gini", "oke", "ehm"), or silence >1s.
+**NEVER start with:** greetings, filler words ("so like", "okay", "um"), or silence >1s.
 
 ---
 
@@ -420,8 +420,8 @@ OUTPUT FIELDS
 (3) hook — EXACT first words from transcript (word-for-word)
 (4) closing_line — EXACT last words from transcript (word-for-word, must be a natural endpoint)
 (5) caption — Max 280 chars. Hook line + what happens + CTA + 2-3 hashtags
-(6) title — Max 8 words for on-screen overlay. Casual Bahasa Indonesia.
-(7) comment_bait — Question to drive comments, <15 words, casual Bahasa Indonesia
+(6) title — Max 8 words for on-screen overlay. Casual English.
+(7) comment_bait — Question to drive comments, <15 words, casual English
 
 Return JSON array sorted by clip_score descending:
 
@@ -465,7 +465,7 @@ VIRAL CONTENT DEFINED:
 
 Clip duration: {min_dur}–{max_dur} seconds. Maximum {max_clips} clips. Output JSON array only — no explanation, no markdown fence.
 
-IMPORTANT — LANGUAGE: ALL text fields (reason, topic, hook, caption, title, closing_line, comment_bait) MUST be written in Bahasa Indonesia. Match the language of the transcript. Do NOT write these fields in English.
+IMPORTANT — LANGUAGE: ALL text fields (reason, topic, hook, caption, title, closing_line, comment_bait) MUST be written in English. Match the language of the transcript. Do NOT write these fields in other languages.
 
 ---
 
@@ -487,18 +487,18 @@ VIRAL HOOK REQUIREMENTS (NON-NEGOTIABLE)
 The first 2 seconds determine everything. A viral hook MUST have:
 
 **ONE of these patterns:**
-- **Bold claim**: "90% orang salah soal ini..." / "Kebanyakan orang gagal karena..."
-- **Direct question**: "Kenapa lo selalu gagal di...?" / "Pernah nggak sih...?"
-- **Shocking statement**: "Ini rahasia yang nggak mau mereka tau..." / "Faktanya..."
+- **Bold claim**: "90% of people get this wrong..." / "Most people fail because..."
+- **Direct question**: "Why do you always fail at...?" / "Have you ever...?"
+- **Shocking statement**: "This is the secret they don't want you to know..." / "The fact is..."
 - **Pattern interrupt**: Mid-sentence energy, controversy, unexpected statement
-- **Pain point**: "Lo pernah ngerasa stuck nggak?" / "Masalah terbesar lo adalah..."
-- **Promise**: "Gue bakal kasih tau cara..." / "Ini yang bakal ubah hidup lo..."
+- **Pain point**: "Have you ever felt stuck?" / "Your biggest problem is..."
+- **Promise**: "I'm going to show you how..." / "This will change your life..."
 
 **NEVER start with:**
-- Greetings: "halo semua", "selamat pagi", "welcome"
-- Filler: "jadi gini ya", "oke", "ehm", "anu"
-- Context-setting: "sebelumnya kita udah bahas", "kali ini kita akan"
-- Throat-clearing: "maaf", "sorry", "bentar ya"
+- Greetings: "hello everyone", "good morning", "welcome"
+- Filler: "so like", "okay", "um", "uh"
+- Context-setting: "before we discussed", "this time we will"
+- Throat-clearing: "sorry", "wait a moment"
 
 Speech must start within 0.5 seconds. Any silence >1s at the start = instant scroll.
 
@@ -517,10 +517,10 @@ The last 3 seconds determine if people share, comment, or rewatch:
 - Callback to the hook (full circle moment)
 
 **Weak endings (AVOID):**
-- Trailing off: "jadi...", "gitu sih", "ya kurang lebih"
+- Trailing off: "so...", "that's it", "like"
 - Mid-sentence cuts
-- Filler words: "um", "eh", "jadi"
-- Boring conclusions: "oke sekian", "terima kasih"
+- Filler words: "um", "uh", "so"
+- Boring conclusions: "okay that's all", "thank you"
 - Incomplete thoughts
 
 Look for [PAUSE] markers in transcript — they indicate natural sentence boundaries.
@@ -573,7 +573,7 @@ score_emotional_payoff — Does it trigger a reaction?
 0–29   | NONE: Completely forgettable.
 
 score_clarity — Does it work for a NON-TECHNICAL viewer with zero AI background?
-90–100 | FULLY ACCESSIBLE: Any Indonesian viewer understands it cold — no tech background needed.
+90–100 | FULLY ACCESSIBLE: Any viewer understands it cold — no tech background needed.
 70–89  | MOSTLY CLEAR: Minor context gap, but the emotional/human angle still lands.
 50–69  | REQUIRES BASIC KNOWLEDGE: Needs some AI familiarity to follow.
 30–49  | CONFUSING: Only makes sense to people already in AI.
@@ -629,49 +629,49 @@ Then generate these fields (in this order):
 - Write in 4 parts, separated by line breaks. Total max 280 chars.
   PART 1 — HOOK LINE (max 100 chars, NO hashtags):
     • Visible BEFORE "more" button. Must work as standalone scroll-stopper.
-    • State the core tension, shocking fact, or relatable frustration. Casual Bahasa Indonesia.
-    • GOOD: "Ternyata cara lo ngomong ke AI menentukan seberapa pintar jawabannya."
-    • BAD: "Video ini membahas tentang prompt engineering untuk AI."
+    • State the core tension, shocking fact, or relatable frustration. Casual English.
+    • GOOD: "Turns out how you talk to AI determines how smart it answers."
+    • BAD: "This video discusses prompt engineering for AI."
   PART 2 — INSIGHT (1-2 sentences): One concrete thing viewer learns or can use immediately.
   PART 3 — CTA (pick most fitting):
-    • Teaches actionable thing → "Simpan dulu sebelum ilang."
-    • Surprising/debatable → "Kamu setuju? Komen di bawah."
-    • Community-relevant → "Tag temen yang lagi belajar AI."
-    • Creates appetite for more → "Mau bahas lebih dalam? Komen 'lanjut'."
-  PART 4 — HASHTAGS (2-4): 1 broad (#AI), 1 mid-tier (#AIIndonesia), 1 niche (topic-specific), 1 trending if relevant.
+    • Teaches actionable thing → "Save this before it's gone."
+    • Surprising/debatable → "Do you agree? Comment below."
+    • Community-relevant → "Tag a friend who's learning AI."
+    • Creates appetite for more → "Want to dive deeper? Comment 'continue'."
+  PART 4 — HASHTAGS (2-4): 1 broad (#AI), 1 mid-tier (#AITools), 1 niche (topic-specific), 1 trending if relevant.
 
 (5) title
 - For TikTok/Instagram/YouTube on-screen overlay AND metadata. Max 8 words. No jargon. Non-technical audience.
 - JARGON TRANSLATION (never use raw technical terms in titles):
-    • LLM/GPT → "otak AI" atau "AI paling canggih"
-    • RAG → "AI yang bisa baca dokumenmu"
-    • Fine-tuning → "ngajarin AI dari nol"
-    • Embeddings → "cara AI ngerti makna kata"
-    • Prompt engineering → "trik dapetin hasil AI terbaik"
-    • Token/tokenizer → "satuan pikiran AI"
-    • Context window → "memori AI"
-    • Hallucination → "AI yang ngarang fakta"
-    • AI agent → "AI yang bisa kerja sendiri"
+    • LLM/GPT → "AI brain" or "smartest AI"
+    • RAG → "AI that reads your documents"
+    • Fine-tuning → "teaching AI from scratch"
+    • Embeddings → "how AI understands meaning"
+    • Prompt engineering → "tricks to get best AI results"
+    • Token/tokenizer → "AI's thought units"
+    • Context window → "AI's memory"
+    • Hallucination → "AI that makes up facts"
+    • AI agent → "AI that works on its own"
     • Unknown term → translate to what it DOES for users, not what it IS.
 - PICK ONE viral formula:
-    A — Number + Outcome: "[N] Cara [Outcome] Pakai AI"
-    B — Expose the Lie: "Semua Orang Salah soal [Topik]..."
-    C — Secret: "Ini yang Nggak Diajarkan di [Tempat]..."
-    D — Comparison Shock: "[A] vs [B] — Siapa Lebih [Outcome]?"
-    E — Personal Stakes: "Kalau Lo Belum Tau Ini, Lo Bakal [Kerugian]"
-    F — How + Wonder: "Gimana [AI/Tool] Bisa [Hal yang Mustahil Kedengarannya]"
-- NEVER: acronyms first (RAG, LLM, API), passive voice ("Dibahas:"), pure description.
-- GOOD: "Kenapa AI Bisa Bohong Tanpa Sadar?" | BAD: "Penjelasan Hallucination di LLM"
+    A — Number + Outcome: "[N] Ways to [Outcome] with AI"
+    B — Expose the Lie: "Everyone's Wrong About [Topic]..."
+    C — Secret: "What They Don't Teach You About [Topic]..."
+    D — Comparison Shock: "[A] vs [B] — Who's Better at [Outcome]?"
+    E — Personal Stakes: "If You Don't Know This, You'll [Loss]"
+    F — How + Wonder: "How [AI/Tool] Can [Impossible-Sounding Thing]"
+- NEVER: acronyms first (RAG, LLM, API), passive voice ("Discussed:"), pure description.
+- GOOD: "Why AI Can Lie Without Knowing" | BAD: "Explanation of Hallucination in LLMs"
 
 (6) closing_line
 - The EXACT last words from the transcript — word-for-word. Must be a strong ending (see requirements above).
 
 (7) comment_bait
-- Single question to drive COMMENTS. Under 15 words. Casual Bahasa Indonesia.
+- Single question to drive COMMENTS. Under 15 words. Casual English.
 - Must be an OPINION or experience-sharing prompt — NOT a knowledge quiz.
-- GOOD: "Menurut lo, AI bakal gantiin programmer dalam 5 tahun?"
-- GOOD: "Ada yang udah pernah coba ini? Hasilnya gimana?"
-- NEVER: "Apa itu X?", "Subscribe ya!", "Like kalau suka!"
+- GOOD: "Do you think AI will replace programmers in 5 years?"
+- GOOD: "Has anyone tried this? What were your results?"
+- NEVER: "What is X?", "Subscribe!", "Like if you agree!"
 
 ---
 

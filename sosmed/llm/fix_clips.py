@@ -1,5 +1,5 @@
 """
-Fix and improve clips: translate to Indonesian, fix caption-topic mismatches, deduplicate topics.
+"""Fix and improve clips: translate to English, fix caption-topic mismatches, deduplicate topics.
 """
 
 import json
@@ -66,7 +66,7 @@ def fix_and_improve_clips(
 ) -> list[dict[str, Any]]:
     """
     Post-process clips to:
-    1. Translate to Indonesian if needed
+    1. Translate to English if needed
     2. Fix mismatched caption/topic pairs
     3. Improve titles/hooks/captions and deduplicate similar topics
 
@@ -81,9 +81,9 @@ def fix_and_improve_clips(
 
     log("INFO", f"Starting clip fixing pipeline: {len(clips)} clips")
 
-    # Step 1: Translate to Indonesian (skip if already Indonesian)
-    log("INFO", "Step 1/3: Translating to Indonesian...")
-    clips = _translate_to_indonesian(clips, llm_model, api_key, detected_language)
+    # Step 1: Translate to English (skip if already English)
+    log("INFO", "Step 1/3: Translating to English...")
+    clips = _translate_to_english(clips, llm_model, api_key, detected_language)
     log("OK", f"After translation: {len(clips)} clips")
 
     # Step 2: Fix mismatched caption/topic
@@ -104,60 +104,68 @@ def fix_and_improve_clips(
     return clips
 
 
-def _translate_to_indonesian(
+def _translate_to_english(
     clips: list[dict[str, Any]],
     llm_model: str | None = None,
     api_key: str | None = None,
     detected_language: dict[str, Any] | None = None,
+    max_retries: int = 2,
 ) -> list[dict[str, Any]]:
     """
-    Translate title, topic, caption, hook to Indonesian if not already Indonesian.
-    Skips translation if Whisper detected Indonesian with >60% confidence.
+    Translate title, topic, caption, hook to English if not already English.
+    Skips translation if Whisper detected English with >60% confidence.
     """
     if not clips:
         return clips
-    
-    # Skip translation if already Indonesian (based on Whisper detection)
+
+    # Skip translation if already English (based on Whisper detection)
     if detected_language:
         lang = detected_language.get("language", "").lower()
         prob = detected_language.get("language_probability", 0.0)
-        if lang == "id" and prob > 0.6:
-            log("OK", f"Language detected as Indonesian (p={prob:.0%}), skipping translation")
+        if lang == "en" and prob > 0.6:
+            log("OK", f"Language detected as English (p={prob:.0%}), skipping translation")
             return clips
 
     # Read the translation prompt from docs/prompts.md
-    prompt_text = _read_prompt("Translate to Indonesian")
+    prompt_text = _read_prompt("Translate to English")
 
     # Prepare user message with clips
     clips_json = json.dumps(clips, ensure_ascii=False, indent=2)
     user_message = f"{prompt_text}\n\nClips to translate:\n{clips_json}"
 
-    # Call LLM
-    system_message = "You are a helpful assistant that translates content to Indonesian while preserving meaning and tone."
-    result = call_llm(system_message, user_message, api_key, llm_model)
+    # Call LLM with retry
+    system_message = "You are a helpful assistant that translates content to English while preserving meaning and tone."
+    result = None
+    for attempt in range(max_retries + 1):
+        try:
+            raw_result = call_llm(system_message, user_message, api_key, llm_model)
+            if raw_result and isinstance(raw_result, list) and all(isinstance(c, dict) for c in raw_result):
+                result = raw_result
+                break
+            else:
+                log("WARN", f"Translation attempt {attempt + 1}/{max_retries + 1}: malformed response, retrying...")
+        except Exception as e:
+            log("WARN", f"Translation attempt {attempt + 1}/{max_retries + 1}: {e}, retrying...")
 
-    # Validate and merge results
-    if result and isinstance(result, list):
-        # If LLM returned structured JSON as expected
-        if all(isinstance(c, dict) for c in result):
-            # Merge the translated fields back into original clips
-            # Use (start, end) as key since clips are identified by timing
-            result_map = {(round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c for c in result}
-            matched_count = 0
-            for orig_clip in clips:
-                key = (round(orig_clip.get("start", 0), 2), round(orig_clip.get("end", 0), 2))
-                if key in result_map:
-                    trans_clip = result_map[key]
-                    # Update translatable fields
-                    for field in ["title", "topic", "caption", "hook"]:
-                        if field in trans_clip:
-                            orig_clip[field] = trans_clip[field]
-                    matched_count += 1
-            log("OK", f"Translation: matched {matched_count}/{len(clips)} clips")
-        else:
-            log("WARN", "Translation LLM did not return structured list")
-    else:
-        log("WARN", "Translation LLM returned no valid results")
+    # Graceful fallback: if all retries failed, return original clips
+    if not result:
+        log("WARN", "Translation failed after retries, keeping original clips unchanged")
+        return clips
+
+    # Merge the translated fields back into original clips
+    # Use (start, end) as key since clips are identified by timing
+    result_map = {(round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c for c in result}
+    matched_count = 0
+    for orig_clip in clips:
+        key = (round(orig_clip.get("start", 0), 2), round(orig_clip.get("end", 0), 2))
+        if key in result_map:
+            trans_clip = result_map[key]
+            # Update translatable fields
+            for field in ["title", "topic", "caption", "hook"]:
+                if field in trans_clip:
+                    orig_clip[field] = trans_clip[field]
+            matched_count += 1
+    log("OK", f"Translation: matched {matched_count}/{len(clips)} clips")
 
     return clips
 
@@ -166,6 +174,7 @@ def _fix_caption_topic_mismatch(
     clips: list[dict[str, Any]],
     llm_model: str | None = None,
     api_key: str | None = None,
+    max_retries: int = 2,
 ) -> list[dict[str, Any]]:
     """
     Ensure caption and topic are aligned.
@@ -180,27 +189,36 @@ def _fix_caption_topic_mismatch(
     user_message = f"{prompt_text}\n\nClips:\n{clips_json}"
 
     system_message = "You are an expert content strategist ensuring social media content consistency."
-    result = call_llm(system_message, user_message, api_key, llm_model)
+    result = None
+    for attempt in range(max_retries + 1):
+        try:
+            raw_result = call_llm(system_message, user_message, api_key, llm_model)
+            if raw_result and isinstance(raw_result, list) and all(isinstance(c, dict) for c in raw_result):
+                result = raw_result
+                break
+            else:
+                log("WARN", f"Caption-topic fix attempt {attempt + 1}/{max_retries + 1}: malformed response, retrying...")
+        except Exception as e:
+            log("WARN", f"Caption-topic fix attempt {attempt + 1}/{max_retries + 1}: {e}, retrying...")
 
-    if result and isinstance(result, list):
-        if all(isinstance(c, dict) for c in result):
-            # Use (start, end) as key for matching clips
-            result_map = {(round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c for c in result}
-            matched_count = 0
-            for orig_clip in clips:
-                key = (round(orig_clip.get("start", 0), 2), round(orig_clip.get("end", 0), 2))
-                if key in result_map:
-                    fixed_clip = result_map[key]
-                    # Update caption/topic fields
-                    for field in ["caption", "topic"]:
-                        if field in fixed_clip:
-                            orig_clip[field] = fixed_clip[field]
-                    matched_count += 1
-            log("OK", f"Caption-topic fix: matched {matched_count}/{len(clips)} clips")
-        else:
-            log("WARN", "Caption-topic fix LLM did not return structured list")
-    else:
-        log("WARN", "Caption-topic fix LLM returned no valid results")
+    # Graceful fallback: if all retries failed, return original clips
+    if not result:
+        log("WARN", "Caption-topic fix failed after retries, keeping original clips unchanged")
+        return clips
+
+    # Use (start, end) as key for matching clips
+    result_map = {(round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c for c in result}
+    matched_count = 0
+    for orig_clip in clips:
+        key = (round(orig_clip.get("start", 0), 2), round(orig_clip.get("end", 0), 2))
+        if key in result_map:
+            fixed_clip = result_map[key]
+            # Update caption/topic fields
+            for field in ["caption", "topic"]:
+                if field in fixed_clip:
+                    orig_clip[field] = fixed_clip[field]
+            matched_count += 1
+    log("OK", f"Caption-topic fix: matched {matched_count}/{len(clips)} clips")
 
     return clips
 
@@ -209,6 +227,7 @@ def _improve_and_deduplicate(
     clips: list[dict[str, Any]],
     llm_model: str | None = None,
     api_key: str | None = None,
+    max_retries: int = 2,
 ) -> list[dict[str, Any]]:
     """
     Improve titles, topics, captions, hooks.
@@ -224,42 +243,49 @@ def _improve_and_deduplicate(
     user_message = f"{prompt_text}\n\nClips:\n{clips_json}"
 
     system_message = "You are an expert social media strategist optimizing video clips for viral engagement."
-    result = call_llm(system_message, user_message, api_key, llm_model)
+    result = None
+    for attempt in range(max_retries + 1):
+        try:
+            raw_result = call_llm(system_message, user_message, api_key, llm_model)
+            if raw_result and isinstance(raw_result, list) and all(isinstance(c, dict) for c in raw_result):
+                result = raw_result
+                break
+            else:
+                log("WARN", f"Improve-deduplicate attempt {attempt + 1}/{max_retries + 1}: malformed response, retrying...")
+        except Exception as e:
+            log("WARN", f"Improve-deduplicate attempt {attempt + 1}/{max_retries + 1}: {e}, retrying...")
 
-    if result and isinstance(result, list):
-        if all(isinstance(c, dict) for c in result):
-            # Merge improved clips back with original metadata
-            # Create map of original clips by timing
-            orig_map = {(round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c for c in clips}
-            
-            # Process LLM results: preserve metadata from originals, use improvements from LLM
-            deduplicated = []
-            for improved_clip in result:
-                key = (round(improved_clip.get("start", 0), 2), round(improved_clip.get("end", 0), 2))
-                if key in orig_map:
-                    orig = orig_map[key]
-                    # Merge: keep all original fields, update with improved content fields
-                    merged = orig.copy()
-                    for field in ["title", "topic", "caption", "hook"]:
-                        if field in improved_clip:
-                            merged[field] = improved_clip[field]
-                    deduplicated.append(merged)
-                else:
-                    # If not found in originals, use as-is (LLM may have created new clips)
-                    deduplicated.append(improved_clip)
+    # Graceful fallback: if all retries failed, return original clips
+    if not result:
+        log("WARN", "Improve-deduplicate failed after retries, keeping original clips unchanged")
+        return clips
 
-            # Renumber ranks sequentially after deduplication
-            # (LLM dedup may remove clips, leaving gaps in original numbering)
-            for i, c in enumerate(deduplicated, 1):
-                c["rank"] = i
+    # Merge improved clips back with original metadata
+    # Create map of original clips by timing
+    orig_map = {(round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c for c in clips}
 
-            return deduplicated
+    # Process LLM results: preserve metadata from originals, use improvements from LLM
+    deduplicated = []
+    for improved_clip in result:
+        key = (round(improved_clip.get("start", 0), 2), round(improved_clip.get("end", 0), 2))
+        if key in orig_map:
+            orig = orig_map[key]
+            # Merge: keep all original fields, update with improved content fields
+            merged = orig.copy()
+            for field in ["title", "topic", "caption", "hook"]:
+                if field in improved_clip:
+                    merged[field] = improved_clip[field]
+            deduplicated.append(merged)
         else:
-            log("WARN", "Improve-deduplicate LLM did not return structured list")
-    else:
-        log("WARN", "Improve-deduplicate LLM returned no valid results")
+            # If not found in originals, use as-is (LLM may have created new clips)
+            deduplicated.append(improved_clip)
 
-    return clips
+    # Renumber ranks sequentially after deduplication
+    # (LLM dedup may remove clips, leaving gaps in original numbering)
+    for i, c in enumerate(deduplicated, 1):
+        c["rank"] = i
+
+    return deduplicated
 
 
 def translate_subtitle_words(
@@ -270,7 +296,7 @@ def translate_subtitle_words(
     fix_errors: bool = True,
 ) -> list[dict]:
     """
-    Translate word-level subtitle entries to Indonesian, optionally fixing transcription errors.
+    Translate word-level subtitle entries to English, optionally fixing transcription errors.
 
     Groups ``words`` into short phrases, asks the LLM to translate (and optionally fix) each
     phrase, then redistributes the original timestamps proportionally
@@ -319,24 +345,36 @@ def translate_subtitle_words(
         prompt_text = _read_prompt("Fix and Translate Subtitle Phrases")
         system_message = (
             "You are a professional subtitle translator and transcription editor. "
-            "Fix Whisper transcription errors and translate spoken content to natural Indonesian."
+            "Fix Whisper transcription errors and translate spoken content to natural English."
         )
     else:
         prompt_text = _read_prompt("Translate Subtitle Phrases")
         system_message = (
             "You are a professional subtitle translator. "
-            "Translate spoken Indonesian-language content accurately and naturally."
+            "Translate spoken content to natural English accurately."
         )
 
     phrases_json = json.dumps(phrases, ensure_ascii=False, indent=2)
     user_message = f"{prompt_text}\n\nPhrases to translate:\n{phrases_json}"
 
-    result = call_llm(system_message, user_message, api_key, llm_model)
+    # Call LLM with retry
+    max_retries = 2
+    result = None
+    for attempt in range(max_retries + 1):
+        try:
+            raw_result = call_llm(system_message, user_message, api_key, llm_model)
+            if raw_result and isinstance(raw_result, list) and all(isinstance(p, dict) for p in raw_result):
+                result = raw_result
+                break
+            else:
+                log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1}: malformed response, retrying...")
+        except Exception as e:
+            log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1}: {e}, retrying...")
 
-    if not result or not isinstance(result, list) or not all(isinstance(p, dict) for p in result):
-        raise RuntimeError(
-            f"Subtitle translation failed: LLM returned {result!r}"
-        )
+    # Graceful fallback: if all retries failed, return original words unchanged
+    if not result:
+        log("WARN", "Subtitle translation failed after retries, keeping original words unchanged")
+        return words
 
     # Build id→translated_text map
     id_to_text: dict[int, str] = {}
@@ -355,16 +393,18 @@ def translate_subtitle_words(
 
         translated_text = id_to_text.get(i)
         if not translated_text:
-            raise RuntimeError(
-                f"Subtitle translation missing for phrase id={i}: "
-                f"'{' '.join(w['word'] for w in grp)}'"
-            )
+            log("WARN", f"Subtitle translation missing for phrase id={i}, keeping original")
+            # Fallback: keep original words for this phrase
+            for w in grp:
+                translated_words.append(w.copy())
+            continue
 
         trans_words = translated_text.split()
         if not trans_words:
-            raise RuntimeError(
-                f"Subtitle translation produced empty phrase for id={i}"
-            )
+            log("WARN", f"Subtitle translation produced empty phrase for id={i}, keeping original")
+            for w in grp:
+                translated_words.append(w.copy())
+            continue
 
         word_dur = phrase_duration / len(trans_words)
         for j, tw in enumerate(trans_words):
@@ -381,11 +421,11 @@ def translate_subtitle_words(
 def _read_prompt(section_name: str) -> str:
     """
     Get a prompt from prompts.py.
-    section_name: one of "Translate to Indonesian", "Fix Mismatched Caption/Topic", "Improve and Deduplicate Clips"
+    section_name: one of "Translate to English", "Fix Mismatched Caption/Topic", "Improve and Deduplicate Clips"
     """
     prompt = get_prompt(section_name)
     if not prompt:
-        log("ERROR", f"Prompt section '{section_name}' not found in prompts.py")
+        raise RuntimeError(f"Prompt section '{section_name}' not found in prompts.py")
     return prompt
 
 

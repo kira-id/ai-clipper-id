@@ -7,4 +7,6 @@ google-auth-oauthlib
 google-auth-httplib2
 ./tiktok-uploader
 pytz
+playwright
+browser-cookie3
 pytest

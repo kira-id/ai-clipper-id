@@ -1553,7 +1553,6 @@ def upload_tiktok(video_path: str, clip: dict) -> bool:
         try:
             from playwright.sync_api import sync_playwright
             import browser_cookie3
-            from pathlib import Path
 
             UPLOAD_URL = "https://www.tiktok.com/tiktokstudio/upload?from=upload&lang=en"
             STEALTH_PROFILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_stealth_profile")

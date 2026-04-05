@@ -155,6 +155,7 @@ def _postprocess_one(
     subtitles: bool = True,
     subtitle_position: str = "lower",
     subtitle_margin_pct: float | None = None,
+    enable_title: bool = False,
     orientation: str = "auto",
     enable_crop: bool = False,
     crop_target: str = "vertical",
@@ -175,7 +176,7 @@ def _postprocess_one(
     1. Person detection + crop (if enabled)
     2. Silence removal (if enabled)
     3. Subtitles overlay
-    4. Title overlay
+    4. Title overlay (if enabled)
     5. Background music mixing (if enabled)
     6. Audio loudnorm
 
@@ -340,7 +341,7 @@ def _postprocess_one(
     # ── 3. Generate title overlay ────────────────────────────────────────────
     title_ass_path = None
     title = clip.get("title") or clip.get("topic") or ""
-    if title:
+    if enable_title and title:
         title_content = generate_title_overlay(
             title,
             play_res_x=out_w,
@@ -584,6 +585,7 @@ def postprocess_clips(
     subtitles: bool = True,
     subtitle_position: str = "lower",
     subtitle_margin_pct: float | None = None,
+    enable_title: bool = False,
     orientation: str = "auto",
     enable_crop: bool = False,
     crop_target: str = "vertical",
@@ -608,6 +610,7 @@ def postprocess_clips(
         subtitles: Enable subtitle overlay
         subtitle_position: "lower", "center", or "upper"
         subtitle_margin_pct: Margin percentage for subtitle position (e.g. 25 for "lower" position)
+        enable_title: Enable title text overlay at top of video
         enable_crop: Enable person-detection crop
         crop_target: "vertical", "horizontal", or "square"
         enable_split_screen: Enable split-screen layout (face on top, gameplay on bottom)
@@ -628,6 +631,8 @@ def postprocess_clips(
     features = []
     if subtitles:
         features.append("subtitles")
+    if enable_title:
+        features.append("title-overlay")
     if enable_crop:
         features.append(f"crop({crop_target})")
     if enable_split_screen:
@@ -671,6 +676,7 @@ def postprocess_clips(
                 subtitles=subtitles,
                 subtitle_position=subtitle_position,
                 subtitle_margin_pct=subtitle_margin_pct,
+                enable_title=enable_title,
                 enable_crop=enable_crop,
                 crop_target=crop_target,
                 enable_split_screen=enable_split_screen,

@@ -67,14 +67,14 @@ def _build_full_video_clip(
     }
 
 
-def _should_translate_to_indonesian(detected_language: dict | None) -> bool:
-    """Return True when subtitle translation to Indonesian is still needed."""
+def _should_translate_to_english(detected_language: dict | None) -> bool:
+    """Return True when subtitle translation to English is still needed."""
     if not detected_language:
         return True
 
     lang = str(detected_language.get("language", "")).lower()
     prob = float(detected_language.get("language_probability", 0.0) or 0.0)
-    return not (lang == "id" and prob > 0.6)
+    return not (lang == "en" and prob > 0.6)
 
 
 def process_single_video(
@@ -314,7 +314,7 @@ def process_single_video(
         log("OK", f"  Topic: {best_clip.get('topic', 'N/A')}")
         log("OK", f"  Title: {best_clip.get('title', 'N/A')}")
 
-        # ── 3c. Translate subtitle words to Indonesian ───────────────────────────
+        # ── 3c. Translate subtitle words to English ───────────────────────────
         if subtitles:
             from .subtitles import get_clip_words
             raw_words = get_clip_words(
@@ -322,8 +322,8 @@ def process_single_video(
                 clip_start=best_clip["start"],
                 clip_end=best_clip["end"],
             )
-            if _should_translate_to_indonesian(detected_language):
-                log("INFO", "Translating subtitle words to Indonesian (with Whisper error fixing)...")
+            if _should_translate_to_english(detected_language):
+                log("INFO", "Translating subtitle words to English (with Whisper error fixing)...")
                 best_clip["_subtitle_words"] = translate_subtitle_words(
                     raw_words,
                     llm_model=llm_model,
@@ -332,8 +332,8 @@ def process_single_video(
                 )
                 log("OK", f"Subtitle translation complete: {len(best_clip['_subtitle_words'])} words")
             else:
-                log("INFO", "Whisper detected Indonesian, but still fixing transcription errors...")
-                # Even if language is Indonesian, still fix transcription errors
+                log("INFO", "Whisper detected English, but still fixing transcription errors...")
+                # Even if language is English, still fix transcription errors
                 best_clip["_subtitle_words"] = translate_subtitle_words(
                     raw_words,
                     llm_model=llm_model,
@@ -394,8 +394,8 @@ def process_single_video(
             clip_start=best_clip["start"],
             clip_end=best_clip["end"],
         )
-        if _should_translate_to_indonesian(detected_language):
-            log("INFO", "Translating subtitle words to Indonesian (with Whisper error fixing)...")
+        if _should_translate_to_english(detected_language):
+            log("INFO", "Translating subtitle words to English (with Whisper error fixing)...")
             best_clip["_subtitle_words"] = translate_subtitle_words(
                 raw_words,
                 llm_model=llm_model,
@@ -404,7 +404,7 @@ def process_single_video(
             )
             log("OK", f"Subtitle translation complete: {len(best_clip['_subtitle_words'])} words")
         else:
-            log("INFO", "Whisper detected Indonesian, but still fixing transcription errors...")
+            log("INFO", "Whisper detected English, but still fixing transcription errors...")
             best_clip["_subtitle_words"] = translate_subtitle_words(
                 raw_words,
                 llm_model=llm_model,
@@ -443,6 +443,7 @@ def process_single_video(
             subtitles=subtitles,
             subtitle_position=subtitle_position,
             subtitle_margin_pct=subtitle_margin_pct,
+            enable_title=False,
             enable_music=music,
             music_entries=music_entries,
             music_volume=music_volume,
@@ -675,9 +676,9 @@ def main() -> None:
                     choices=["tiny", "base", "small", "medium",
                              "large-v2", "large-v3", "distil-large-v3", "turbo"],
                     help="Whisper model size (default: from config or turbo)")
-    ap.add_argument("--lang", default="id",
-                    help="Language code — 'id' Indonesian, 'en' English, "
-                         "or None for auto-detect (default: id)")
+    ap.add_argument("--lang", default="en",
+                    help="Language code — 'en' English, 'id' Indonesian, "
+                         "or None for auto-detect (default: en)")
     ap.add_argument("--device", default="auto",
                     choices=["auto", "cuda", "cpu"],
                     help="Compute device (default: auto)")

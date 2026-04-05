@@ -99,11 +99,9 @@ def _prepare_subtitles(clips, segments, args, detected_language):
         return
 
     from .subtitles import get_clip_words
-    from .process_single import _should_translate_to_indonesian
-    need_translate = _should_translate_to_indonesian(detected_language)
     
-    # Always enable fix_errors - even if Indonesian, fix Whisper transcription errors
-    log("INFO", "Fixing Whisper transcription errors and translating subtitles to Indonesian...")
+    # Always enable fix_errors - even if English, fix Whisper transcription errors
+    log("INFO", "Fixing Whisper transcription errors and translating subtitles to English...")
     from .llm import translate_subtitle_words
     
     for clip in clips:
@@ -152,7 +150,7 @@ def main() -> None:
     defaults = get_defaults()
 
     ap = argparse.ArgumentParser(
-        description="AI Video Clipper — Indonesian-optimized, auto clip count",
+        description="AI Video Clipper — English-optimized, auto clip count",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Environment variables:\n"
@@ -173,7 +171,7 @@ def main() -> None:
                              "large-v2", "large-v3", "distil-large-v3", "turbo"],
                     help=f"Whisper model size (default: {defaults['whisper_model']})")
     ap.add_argument("--lang", default=defaults["language"],
-                    help=f"Language code — 'id' Indonesian, 'en' English, "
+                    help=f"Language code — 'en' English, 'id' Indonesian, "
                          f"or None for auto-detect (default: {defaults['language']})")
     ap.add_argument("--min", type=int, default=defaults["min_clip_duration"],
                     help=f"Min clip duration in seconds (default: {defaults['min_clip_duration']})")
@@ -220,6 +218,9 @@ def main() -> None:
     ap.add_argument("--subtitle-position", default=defaults["subtitle_position"],
                     choices=["center", "upper", "lower"],
                     help=f"Subtitle position (default: {defaults['subtitle_position']})")
+    ap.add_argument("--title", action=argparse.BooleanOptionalAction,
+                    default=False,
+                    help="Overlay clip title at the top of the video (default: off)")
     ap.add_argument("--orientation", default="auto",
                     choices=["auto", "portrait", "landscape"],
                     help="Force output orientation: portrait (9:16), landscape (16:9), "
@@ -314,6 +315,7 @@ def main() -> None:
 
         pp_features = []
         if args.subtitles: pp_features.append("TikTok Subs")
+        if args.title: pp_features.append("Title Overlay")
         if args.orientation != "auto": pp_features.append(f"Force {args.orientation}")
         if args.split_screen: pp_features.append("Split-Screen")
         elif args.crop: pp_features.append(f"Crop({args.crop_target})")
@@ -379,7 +381,7 @@ def main() -> None:
         # Post-process
         _cta_cfg = {**_cta_defaults, "enabled": args.cta}
         log("DEBUG", f"Example mode postprocess: orientation={args.orientation}, crop={args.crop}")
-        any_postprocess = args.subtitles or args.orientation != "auto" or args.crop or args.music or args.remove_silence or args.cta
+        any_postprocess = args.subtitles or args.title or args.orientation != "auto" or args.crop or args.music or args.remove_silence or args.cta
         if any_postprocess and raw_outputs:
             outputs = postprocess_clips(
                 raw_outputs,
@@ -388,6 +390,7 @@ def main() -> None:
                 output_dir=output_dir,
                 subtitles=args.subtitles,
                 subtitle_position=args.subtitle_position,
+                enable_title=args.title,
                 orientation=args.orientation,
                 enable_crop=args.crop,
                 crop_target=args.crop_target,
@@ -446,7 +449,7 @@ def main() -> None:
                         return
 
     print(f"\n{BOLD}{CYAN}{'═' * 50}")
-    print(f"   AI Video Clipper — Indonesian-optimized")
+    print(f"   AI Video Clipper — English-optimized")
     print(f"{'═' * 50}{RESET}")
     print(f"  Video     : {video.name}")
     print(f"  Model     : {args.model}")
@@ -456,6 +459,7 @@ def main() -> None:
     # Show post-processing features
     pp_features = []
     if args.subtitles: pp_features.append("TikTok Subs")
+    if args.title: pp_features.append("Title Overlay")
     if args.orientation != "auto": pp_features.append(f"Force {args.orientation}")
     if args.crop: pp_features.append(f"Crop({args.crop_target})")
     if args.music: pp_features.append("Music")
@@ -572,7 +576,7 @@ def main() -> None:
             log("OK", "Clip boundaries optimized for viral hooks and natural endings")
 
         # ── 3b. Improve and fix clips ──────────────────────────────────────
-        log("INFO", "Improving clips: translate to Indonesian, fix captions, deduplicate topics...")
+        log("INFO", "Improving clips: translate to English, fix captions, deduplicate topics...")
         clips = fix_and_improve_clips(
             clips,
             llm_model=args.llm_model,
@@ -627,7 +631,7 @@ def main() -> None:
 
     # ── 6. Post-process ──────────────────────────────────────────────────────
     _cta_cfg = {**_cta_defaults, "enabled": args.cta}
-    any_postprocess = args.subtitles or args.orientation != "auto" or args.crop or args.music or args.remove_silence or args.cta
+    any_postprocess = args.subtitles or args.title or args.orientation != "auto" or args.crop or args.music or args.remove_silence or args.cta
     if any_postprocess and raw_outputs:
         crop_target = _get_crop_target_from_orientation(args.orientation)
         outputs = postprocess_clips(
@@ -637,6 +641,7 @@ def main() -> None:
             output_dir=output_dir,
             subtitles=args.subtitles,
             subtitle_position=args.subtitle_position,
+            enable_title=args.title,
             orientation=args.orientation,
             enable_crop=args.crop,
             crop_target=crop_target,
