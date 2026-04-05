@@ -16,12 +16,13 @@ Field requirements (in this order):
 - title: Max 8 words. No jargon. Non-technical audience. Translate technical terms to plain English (e.g., "large language model" → "AI brain", "fine-tuning" → "AI training"). Use viral formula (Number+Outcome, Expose Lie, Secret, Comparison, Personal Stakes, or How+Wonder).
 - topic: one clear sentence describing the core idea or debate
 - caption: 4-part structure (hook line → insight → CTA → hashtags). Total max 280 chars.
-- comment_bait: Single opinion/experience question to drive comments. Under 15 words. NOT a knowledge quiz.
+- comment_bait: Single opinion/experience question to drive comments. Under 15 words. NOT a knowledge quiz. Write in casual Indonesian.
 - hook: the strongest opening line or a tightened version that stays faithful to the transcript
 - closing_line: The EXACT last words from the transcript — word-for-word. Must be a strong ending.
 
 Language rules:
-- Write all fields (reason, title, topic, caption, comment_bait, hook, closing_line) in English
+- Write all fields (reason, title, topic, caption, hook, closing_line) in English
+- Write comment_bait in casual Indonesian
 - If the transcript is in a different language, translate concepts to English while maintaining meaning
 - Do not use the filename or generic placeholders as metadata.
 - Do not invent facts not supported by the transcript.
@@ -30,14 +31,14 @@ Return ONLY valid JSON array, no other text.""",
 
     "Translate to English": """Given clips data in JSON format, perform the following:
 
-1. For each clip, analyze the language of the fields: reason, topic, caption, hook, closing_line, comment_bait
+1. For each clip, analyze the language of the fields: reason, topic, caption, hook, closing_line
 2. If any of these fields are NOT in English, translate them to English
 3. If they are already in English, keep them unchanged
 4. Preserve the meaning, tone, and marketing appeal during translation
-5. Keep all other fields unchanged (title, scores, timing, metadata)
+5. Keep all other fields unchanged (title, comment_bait, scores, timing, metadata)
 6. Return the same JSON array with only the translated/updated fields
 
-IMPORTANT: Do NOT translate the "title" field — keep it exactly as-is.
+IMPORTANT: Do NOT translate the "title" or "comment_bait" fields — keep them exactly as-is.
 
 Example input:
 [{"title": "How to cook rice", "topic": "Tips Memasak", "caption": "Pelajari dengan cepat!", "rank": 1, ...}]
