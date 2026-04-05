@@ -421,7 +421,7 @@ OUTPUT FIELDS
 (4) closing_line — EXACT last words from transcript (word-for-word, must be a natural endpoint)
 (5) caption — Max 280 chars. Hook line + what happens + CTA + 2-3 hashtags
 (6) title — Max 8 words for on-screen overlay. Casual English.
-(7) comment_bait — Question to drive comments, <15 words, casual English
+(7) comment_bait — Question to drive comments, <15 words, casual Indonesian
 
 Return JSON array sorted by clip_score descending:
 
@@ -667,10 +667,10 @@ Then generate these fields (in this order):
 - The EXACT last words from the transcript — word-for-word. Must be a strong ending (see requirements above).
 
 (7) comment_bait
-- Single question to drive COMMENTS. Under 15 words. Casual English.
+- Single question to drive COMMENTS. Under 15 words. Casual Indonesian.
 - Must be an OPINION or experience-sharing prompt — NOT a knowledge quiz.
-- GOOD: "Do you think AI will replace programmers in 5 years?"
-- GOOD: "Has anyone tried this? What were your results?"
+- GOOD: "Menurut kamu, AI bakal gantiin programmer dalam 5 tahun?"
+- GOOD: "Ada yang udah pernah nyoba ini? Gimana hasilnya?"
 - NEVER: "What is X?", "Subscribe!", "Like if you agree!"
 
 ---
