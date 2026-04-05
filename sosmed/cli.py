@@ -232,6 +232,9 @@ def main() -> None:
     ap.add_argument("--crop-target", default="vertical",
                     choices=["vertical", "horizontal", "square"],
                     help=f"Target aspect ratio for crop (default: vertical)")
+    ap.add_argument("--split-screen", action="store_true", default=False,
+                    help="Split-screen layout: face close-up on top, gameplay on bottom "
+                         "(for landscape→vertical; implies --crop)")
 
     # ── Background music ─────────────────────────────────────────────────
     ap.add_argument("--music", action=argparse.BooleanOptionalAction,
@@ -281,6 +284,10 @@ def main() -> None:
     lang = None if args.lang.lower() == "none" else args.lang
     video = Path(args.video)
 
+    # --split-screen implies --crop (needs person detection)
+    if args.split_screen:
+        args.crop = True
+
     # ── Example mode: skip to extraction ─────────────────────────────────
     if args.example:
         if not video.exists():
@@ -308,7 +315,8 @@ def main() -> None:
         pp_features = []
         if args.subtitles: pp_features.append("TikTok Subs")
         if args.orientation != "auto": pp_features.append(f"Force {args.orientation}")
-        if args.crop: pp_features.append(f"Crop({args.crop_target})")
+        if args.split_screen: pp_features.append("Split-Screen")
+        elif args.crop: pp_features.append(f"Crop({args.crop_target})")
         if args.music: pp_features.append("Music")
         if args.remove_silence: pp_features.append("Silence-Rm")
         if args.cta: pp_features.append("Instagram-CTA")
@@ -383,6 +391,7 @@ def main() -> None:
                 orientation=args.orientation,
                 enable_crop=args.crop,
                 crop_target=args.crop_target,
+                enable_split_screen=args.split_screen,
                 enable_music=args.music,
                 music_entries=music_entries,
                 music_volume=args.music_volume,
@@ -631,6 +640,7 @@ def main() -> None:
             orientation=args.orientation,
             enable_crop=args.crop,
             crop_target=crop_target,
+            enable_split_screen=args.split_screen,
             enable_music=args.music,
             music_entries=music_entries,
             music_volume=args.music_volume,

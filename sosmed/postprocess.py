@@ -158,6 +158,7 @@ def _postprocess_one(
     orientation: str = "auto",
     enable_crop: bool = False,
     crop_target: str = "vertical",
+    enable_split_screen: bool = False,
     enable_music: bool = False,
     music_entry: dict[str, str] | None = None,
     music_volume: float = 0.06,
@@ -230,6 +231,8 @@ def _postprocess_one(
     # Run person-detection crop ONLY when explicitly requested (enable_crop).
     # Orientation conversion uses orient_scale_filter (simple center crop), not person detection.
     crop_filter = None
+    split_screen = False
+    split_screen_detections: list[dict] | None = None
     _effective_crop_target = crop_target if enable_crop else None
 
     if _effective_crop_target:
@@ -251,8 +254,6 @@ def _postprocess_one(
                     f"Video may have codec issues or contain no detectable persons."
                 )
 
-            # Use dynamic crop regions with interpolation between detections
-            from .person_detection import compute_dynamic_crop_regions, build_dynamic_crop_filter
             if _effective_crop_target == "vertical":
                 target_w, target_h = 1080, 1920
             elif _effective_crop_target == "horizontal":
@@ -260,27 +261,36 @@ def _postprocess_one(
             else:
                 target_w, target_h = 1080, 1080
 
-            # Compute per-segment crop regions with smooth interpolation
-            crop_regions = compute_dynamic_crop_regions(
-                detections, src_w, src_h,
-                target_aspect=target_aspect,
-                segment_duration=1.0,  # 1-second segments for smooth tracking
-                smoothing_window=5,
-            )
+            # Split-screen layout: face close-up on top, gameplay on bottom
+            if enable_split_screen and src_w > src_h:
+                split_screen = True
+                split_screen_detections = detections
+                log("DEBUG", f"Clip #{clip.get('rank')}: using split-screen layout (face + gameplay)")
+            else:
+                # Use dynamic crop regions with interpolation between detections
+                from .person_detection import compute_dynamic_crop_regions, build_dynamic_crop_filter
 
-            if not crop_regions:
-                raise RuntimeError(
-                    f"Clip #{clip.get('rank')}: Could not compute dynamic crop regions from detected persons "
-                    f"for {_effective_crop_target} crop."
+                # Compute per-segment crop regions with smooth interpolation
+                crop_regions = compute_dynamic_crop_regions(
+                    detections, src_w, src_h,
+                    target_aspect=target_aspect,
+                    segment_duration=1.0,  # 1-second segments for smooth tracking
+                    smoothing_window=5,
                 )
 
-            log("DEBUG", f"Clip #{clip.get('rank')}: computed {len(crop_regions)} dynamic crop regions")
+                if not crop_regions:
+                    raise RuntimeError(
+                        f"Clip #{clip.get('rank')}: Could not compute dynamic crop regions from detected persons "
+                        f"for {_effective_crop_target} crop."
+                    )
 
-            # Build dynamic crop filter with zoompan for smooth transitions
-            crop_filter = build_dynamic_crop_filter(
-                crop_regions, src_w, src_h,
-                target_w, target_h,
-            )
+                log("DEBUG", f"Clip #{clip.get('rank')}: computed {len(crop_regions)} dynamic crop regions")
+
+                # Build dynamic crop filter with zoompan for smooth transitions
+                crop_filter = build_dynamic_crop_filter(
+                    crop_regions, src_w, src_h,
+                    target_w, target_h,
+                )
             out_w, out_h = target_w, target_h
 
     # ── 1. Silence removal ───────────────────────────────────────────────────
@@ -368,44 +378,78 @@ def _postprocess_one(
         return f"[{prefix}{label_counter}]"
 
     # Video filter chain
-    vfilters_chain: list[str] = []
+    has_video_filters = False
 
-    # Silence removal (video)
-    if silence_filter_v:
-        vfilters_chain.append(silence_filter_v)
+    if split_screen:
+        # Split-screen layout: face close-up on top, gameplay on bottom
+        from .person_detection import build_split_screen_filter
 
-    # Crop filter (includes its own scale to target resolution)
-    if crop_filter:
-        vfilters_chain.append(crop_filter)
-    elif orient_scale_filter:
-        # Orientation conversion without person-crop
-        vfilters_chain.append(orient_scale_filter)
+        v_input = current_v_label
+        if silence_filter_v:
+            filter_parts.append(f"{v_input}{silence_filter_v}[v_pre_split]")
+            v_input = "[v_pre_split]"
 
-    # Subtitle filters
-    if ass_path:
-        escaped = _escape_ass_path(ass_path)
-        vfilters_chain.append(f"ass={escaped}")
-    if title_ass_path:
-        escaped_title = _escape_ass_path(title_ass_path)
-        vfilters_chain.append(f"ass={escaped_title}")
+        # Post-split linear filters (subtitles, title)
+        post_split: list[str] = []
+        if ass_path:
+            post_split.append(f"ass={_escape_ass_path(ass_path)}")
+        if title_ass_path:
+            post_split.append(f"ass={_escape_ass_path(title_ass_path)}")
 
-    # Build video filter chain with labels
-    if vfilters_chain:
-        if len(vfilters_chain) == 1:
-            filter_parts.append(f"{current_v_label}{vfilters_chain[0]}[vout]")
-        else:
-            parts = []
-            for i, vf in enumerate(vfilters_chain):
-                if i == 0:
-                    out_label = _next_label("v")
-                    parts.append(f"{current_v_label}{vf}{out_label}")
-                elif i == len(vfilters_chain) - 1:
-                    parts.append(f"{out_label}{vf}[vout]")
-                else:
-                    new_label = _next_label("v")
-                    parts.append(f"{out_label}{vf}{new_label}")
-                    out_label = new_label
-            filter_parts.append(";".join(parts))
+        split_out = "[split_out]" if post_split else "[vout]"
+        filter_parts.append(build_split_screen_filter(
+            split_screen_detections, src_w, src_h, out_w, out_h,
+            input_label=v_input, output_label=split_out,
+        ))
+
+        if post_split:
+            cur = split_out
+            for i, pf in enumerate(post_split):
+                out_lbl = "[vout]" if i == len(post_split) - 1 else f"[vp{i}]"
+                filter_parts.append(f"{cur}{pf}{out_lbl}")
+                cur = out_lbl
+
+        has_video_filters = True
+    else:
+        # Standard linear video filter chain
+        vfilters_chain: list[str] = []
+
+        # Silence removal (video)
+        if silence_filter_v:
+            vfilters_chain.append(silence_filter_v)
+
+        # Crop filter (includes its own scale to target resolution)
+        if crop_filter:
+            vfilters_chain.append(crop_filter)
+        elif orient_scale_filter:
+            # Orientation conversion without person-crop
+            vfilters_chain.append(orient_scale_filter)
+
+        # Subtitle filters
+        if ass_path:
+            vfilters_chain.append(f"ass={_escape_ass_path(ass_path)}")
+        if title_ass_path:
+            vfilters_chain.append(f"ass={_escape_ass_path(title_ass_path)}")
+
+        # Build video filter chain with labels
+        if vfilters_chain:
+            if len(vfilters_chain) == 1:
+                filter_parts.append(f"{current_v_label}{vfilters_chain[0]}[vout]")
+            else:
+                parts = []
+                for i, vf in enumerate(vfilters_chain):
+                    if i == 0:
+                        out_label = _next_label("v")
+                        parts.append(f"{current_v_label}{vf}{out_label}")
+                    elif i == len(vfilters_chain) - 1:
+                        parts.append(f"{out_label}{vf}[vout]")
+                    else:
+                        new_label = _next_label("v")
+                        parts.append(f"{out_label}{vf}{new_label}")
+                        out_label = new_label
+                filter_parts.append(";".join(parts))
+
+        has_video_filters = bool(vfilters_chain)
 
     # Audio filter chain
     afilters: list[str] = []
@@ -437,7 +481,7 @@ def _postprocess_one(
         full_filter = ";".join(filter_parts)
         cmd.extend(["-filter_complex", full_filter])
 
-        if vfilters_chain:
+        if has_video_filters:
             cmd.extend(["-map", "[vout]"])
         else:
             cmd.extend(["-map", "0:v:0"])
@@ -473,7 +517,7 @@ def _postprocess_one(
 
     # Use hardware acceleration on macOS (VideoToolbox) for faster encoding
     # Fall back to libx264 if hwaccel disabled or not available
-    if vfilters_chain or silence_filter_v:
+    if has_video_filters or silence_filter_v:
         if use_hwaccel and _is_videotoolbox_available():
             # VideoToolbox: very fast, good quality for social media
             # Note: h264_videotoolbox doesn't support CRF, use quality/speed instead
@@ -543,6 +587,7 @@ def postprocess_clips(
     orientation: str = "auto",
     enable_crop: bool = False,
     crop_target: str = "vertical",
+    enable_split_screen: bool = False,
     enable_music: bool = False,
     music_entries: dict[int, dict[str, str]] | None = None,
     music_volume: float = 0.06,
@@ -565,6 +610,7 @@ def postprocess_clips(
         subtitle_margin_pct: Margin percentage for subtitle position (e.g. 25 for "lower" position)
         enable_crop: Enable person-detection crop
         crop_target: "vertical", "horizontal", or "square"
+        enable_split_screen: Enable split-screen layout (face on top, gameplay on bottom)
         enable_music: Enable background music
         music_entries: Dict mapping clip rank → music entry
         music_volume: Background music volume (0.0–1.0)
@@ -584,6 +630,8 @@ def postprocess_clips(
         features.append("subtitles")
     if enable_crop:
         features.append(f"crop({crop_target})")
+    if enable_split_screen:
+        features.append("split-screen")
     if enable_music:
         features.append("music")
     if enable_silence_removal:
@@ -625,6 +673,7 @@ def postprocess_clips(
                 subtitle_margin_pct=subtitle_margin_pct,
                 enable_crop=enable_crop,
                 crop_target=crop_target,
+                enable_split_screen=enable_split_screen,
                 enable_music=enable_music,
                 music_entry=music_entry,
                 music_volume=music_volume,

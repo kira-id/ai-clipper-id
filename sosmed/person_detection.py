@@ -512,6 +512,130 @@ def _build_interpolation_expr(
     return expr
 
 
+def build_split_screen_filter(
+    detections: list[dict[str, Any]],
+    src_w: int,
+    src_h: int,
+    target_w: int = 1080,
+    target_h: int = 1920,
+    face_ratio: float = 0.4,
+    input_label: str = "[0:v]",
+    output_label: str = "[vout]",
+) -> str:
+    """Build FFmpeg filter for split-screen: face close-up on top, gameplay on bottom.
+
+    For landscape gaming/reaction videos converted to vertical format.
+    Top section shows a close-up crop of the detected person (webcam/face).
+    Bottom section shows the center of the frame (gameplay).
+
+    Args:
+        detections: Person detection results from detect_persons_in_clip
+        src_w: Source video width
+        src_h: Source video height
+        target_w: Output width (default 1080)
+        target_h: Output height (default 1920)
+        face_ratio: Fraction of output height for the face section (default 0.4)
+        input_label: FFmpeg input stream label
+        output_label: FFmpeg output stream label
+
+    Returns:
+        FFmpeg filter_complex fragment with split, crop, scale, and vstack
+    """
+    face_out_h = int(target_h * face_ratio)
+    face_out_h -= face_out_h % 2  # ensure even
+    game_out_h = target_h - face_out_h
+    game_out_h -= game_out_h % 2  # ensure even
+    # Adjust face_out_h so both sum exactly to target_h
+    face_out_h = target_h - game_out_h
+
+    # --- Face crop region ---
+    # Use median bounding box from detections for stable positioning
+    all_boxes = [det["boxes"][0] for det in detections if det.get("boxes")]
+
+    if all_boxes:
+        med_x1 = sorted(b["x1"] for b in all_boxes)[len(all_boxes) // 2]
+        med_y1 = sorted(b["y1"] for b in all_boxes)[len(all_boxes) // 2]
+        med_x2 = sorted(b["x2"] for b in all_boxes)[len(all_boxes) // 2]
+        med_y2 = sorted(b["y2"] for b in all_boxes)[len(all_boxes) // 2]
+    else:
+        # Fallback: bottom-left quadrant (common webcam position)
+        med_x1, med_y1 = 0, src_h // 2
+        med_x2, med_y2 = src_w // 3, src_h
+
+    person_cx = (med_x1 + med_x2) / 2
+    person_cy = (med_y1 + med_y2) / 2
+    person_w = max(med_x2 - med_x1, 1)
+    person_h = max(med_y2 - med_y1, 1)
+
+    # Face crop aspect ratio must match target_w / face_out_h
+    face_aspect = target_w / face_out_h
+
+    # Expand person bbox with padding, then adjust to match face_aspect
+    padding = 0.3
+    padded_w = person_w * (1 + padding)
+    padded_h = person_h * (1 + padding)
+
+    if padded_w / padded_h > face_aspect:
+        face_crop_w = int(padded_w)
+        face_crop_h = int(face_crop_w / face_aspect)
+    else:
+        face_crop_h = int(padded_h)
+        face_crop_w = int(face_crop_h * face_aspect)
+
+    # Minimum crop size (at least 20% of source width)
+    min_w = int(src_w * 0.2)
+    if face_crop_w < min_w:
+        face_crop_w = min_w
+        face_crop_h = int(face_crop_w / face_aspect)
+
+    # Clamp to source, then ensure even
+    face_crop_w = min(face_crop_w, src_w)
+    face_crop_h = min(face_crop_h, src_h)
+    face_crop_w -= face_crop_w % 2
+    face_crop_h -= face_crop_h % 2
+
+    # Ensure minimum dimensions (at least 2x2 after rounding)
+    face_crop_w = max(face_crop_w, 2)
+    face_crop_h = max(face_crop_h, 2)
+
+    # Center on person, clamp to bounds
+    face_x = int(person_cx - face_crop_w / 2)
+    face_y = int(person_cy - face_crop_h / 2)
+    face_x = max(0, min(face_x, src_w - face_crop_w))
+    face_y = max(0, min(face_y, src_h - face_crop_h))
+
+    # --- Gameplay crop region ---
+    # Center of frame horizontally, full height vertically
+    game_aspect = target_w / game_out_h
+
+    if src_w / src_h > game_aspect:
+        # Source wider than game aspect — crop width from center
+        game_crop_h = src_h
+        game_crop_w = int(game_crop_h * game_aspect)
+    else:
+        # Source taller — crop height from center
+        game_crop_w = src_w
+        game_crop_h = int(game_crop_w / game_aspect)
+
+    game_crop_w -= game_crop_w % 2
+    game_crop_h -= game_crop_h % 2
+
+    game_x = (src_w - game_crop_w) // 2
+    game_y = (src_h - game_crop_h) // 2
+
+    log("DEBUG", f"Split-screen: face crop {face_crop_w}x{face_crop_h}+{face_x}+{face_y} → {target_w}x{face_out_h}")
+    log("DEBUG", f"Split-screen: game crop {game_crop_w}x{game_crop_h}+{game_x}+{game_y} → {target_w}x{game_out_h}")
+
+    return (
+        f"{input_label}split=2[_face_in][_game_in];"
+        f"[_face_in]crop={face_crop_w}:{face_crop_h}:{face_x}:{face_y},"
+        f"scale={target_w}:{face_out_h}:flags=lanczos[_face];"
+        f"[_game_in]crop={game_crop_w}:{game_crop_h}:{game_x}:{game_y},"
+        f"scale={target_w}:{game_out_h}:flags=lanczos[_game];"
+        f"[_face][_game]vstack=inputs=2{output_label}"
+    )
+
+
 def needs_crop(src_w: int, src_h: int, target_aspect: str = "vertical") -> bool:
     """Check if the source video needs cropping for the target format.
 
