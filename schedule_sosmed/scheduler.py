@@ -1303,19 +1303,17 @@ def upload_instagram(video_path: str, clip: dict) -> bool:
         log.info(f"📤 Instagram: uploading {clip.get('title', '?')}...")
         _human_pause(1, 3)
 
-        # Upload the clip
-        ig.clip_upload(path=video_path, caption=caption, thumbnail=thumbnail_path)
+        # Upload the clip — clip_upload returns a Media object with the new post's ID
+        uploaded_media = ig.clip_upload(path=video_path, caption=caption, thumbnail=thumbnail_path)
         _post_login_cooldown()
 
-        # Get the media ID to post comment
+        # Use the media ID directly from the upload result
+        # (user_medias can return pinned posts first, not the newly uploaded one)
         media_id = None
         try:
-            # Try to get the recently uploaded media
-            user_id = ig.user_id
-            medias = ig.user_medias(user_id, amount=1)
-            if medias:
-                media_id = str(medias[0].pk)
-                log.debug(f"📎 Instagram: got media ID {media_id} for commenting")
+            if uploaded_media and uploaded_media.pk:
+                media_id = str(uploaded_media.pk)
+                log.debug(f"📎 Instagram: got media ID {media_id} from upload result")
         except Exception as e:
             log.warning(f"⚠️  Instagram: could not get media ID for comment: {e}")
 
