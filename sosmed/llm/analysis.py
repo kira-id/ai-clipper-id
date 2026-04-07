@@ -112,7 +112,9 @@ def _build_user_prompt(
 ) -> str:
     """Build the user prompt for LLM."""
     header = (
-        f"Analyze this transcript and extract every clip with a realistic shot at high views.\n"
+        f"Analyze this transcript and extract ONLY clips with top-tier viral potential.\n"
+        f"Prioritize shareability, comment bait, replay value, and emotional punch over pure informativeness.\n"
+        f"Reject clips that are merely useful or interesting but not likely to spread.\n"
         f"Duration: {min_dur}–{max_dur}s. Max {max_clips} clips. clip_score ≥ {min_score}.\n"
     )
     if chunk_info:

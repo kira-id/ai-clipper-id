@@ -22,12 +22,62 @@ from .utils import log
 _SILENCE_FLOOR = 50.0
 
 
+def _build_speech_regions(
+    segments: list[dict[str, Any]] | None,
+    max_gap: float = 0.45,
+    min_duration: float = 0.12,
+) -> list[tuple[float, float]]:
+    """Build merged speech regions from transcript segments.
+
+    Regions are derived from segment start/end timestamps and merged when the
+    silence gap between adjacent regions is small.
+    """
+    if not segments:
+        return []
+
+    spans: list[tuple[float, float]] = []
+    for seg in segments:
+        try:
+            start = float(seg["start"])
+            end = float(seg["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        spans.append((start, end))
+
+    if not spans:
+        return []
+
+    spans.sort(key=lambda x: x[0])
+    merged: list[tuple[float, float]] = []
+    cur_start, cur_end = spans[0]
+
+    for start, end in spans[1:]:
+        if start - cur_end <= max_gap:
+            cur_end = max(cur_end, end)
+            continue
+        if cur_end - cur_start >= min_duration:
+            merged.append((round(cur_start, 3), round(cur_end, 3)))
+        cur_start, cur_end = start, end
+
+    if cur_end - cur_start >= min_duration:
+        merged.append((round(cur_start, 3), round(cur_end, 3)))
+
+    return merged
+
+
 def _extract_pcm(video_path: str, sample_rate: int = 16000) -> bytes:
-    """Extract mono 16-bit PCM audio from video via ffmpeg."""
+    """Extract mono 16-bit PCM audio from video via ffmpeg.
+
+    A speech-focused band-pass filter (roughly 120-4000 Hz) is applied to
+    reduce background music influence and keep vocal energy dominant.
+    """
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-i", video_path,
         "-vn",                     # no video
+        "-af", "highpass=f=120,lowpass=f=4000",
         "-ac", "1",                # mono
         "-ar", str(sample_rate),   # resample
         "-f", "s16le",             # raw 16-bit little-endian PCM
@@ -109,6 +159,7 @@ def _detect_spikes(
     local_radius: int = 20,
     spike_threshold: float = 2.0,
     high_energy_percentile: float = 80.0,
+    speech_regions: list[tuple[float, float]] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Detect energy spikes — moments where RMS is significantly above local baseline.
@@ -143,7 +194,21 @@ def _detect_spikes(
 
     events: list[dict[str, Any]] = []
 
+    speech_regions = speech_regions or []
+
+    def _is_in_speech_region(t: float) -> bool:
+        if not speech_regions:
+            return False
+        for start, end in speech_regions:
+            if start <= t <= end:
+                return True
+        return False
+
     for i, rms in enumerate(rms_values):
+        t = i * window_sec
+        if not _is_in_speech_region(t):
+            continue
+
         # Skip near-silent windows — no emotion here
         if rms < _SILENCE_FLOOR:
             continue
@@ -158,10 +223,10 @@ def _detect_spikes(
 
         # Spike: sudden jump above local baseline
         if rms > local_median * spike_threshold:
-            events.append({"time": round(i * window_sec, 2), "rms": round(rms, 1), "kind": "spike"})
+            events.append({"time": round(t, 2), "rms": round(rms, 1), "kind": "spike"})
         # Sustained high energy (top percentile AND meaningfully above median)
         elif rms >= high_threshold and rms > global_median * 1.5:
-            events.append({"time": round(i * window_sec, 2), "rms": round(rms, 1), "kind": "high"})
+            events.append({"time": round(t, 2), "rms": round(rms, 1), "kind": "high"})
 
     return events
 
@@ -215,6 +280,7 @@ def _cluster_events(
 
 def analyze_audio_energy(
     video_path: str,
+    segments: list[dict[str, Any]] | None = None,
     sample_rate: int = 16000,
     window_sec: float = 0.5,
 ) -> list[dict[str, Any]]:
@@ -227,8 +293,16 @@ def analyze_audio_energy(
 
     Detection is volume-independent: uses ratio-to-local-median, so a quiet
     streamer who suddenly screams is detected the same as a loud one.
+
+    Energy moments are only emitted inside transcript speech regions. This
+    keeps background music from being treated as emotional peaks.
     """
     log("INFO", "Analyzing audio energy for emotional moments...")
+
+    speech_regions = _build_speech_regions(segments)
+    if not speech_regions:
+        log("INFO", "No speech regions found in transcript — skipping energy analysis")
+        return []
 
     pcm = _extract_pcm(video_path, sample_rate)
     if not pcm:
@@ -248,7 +322,7 @@ def analyze_audio_energy(
     log("DEBUG", f"Computed RMS for {len(rms_values)} windows "
                  f"({len(rms_values) * window_sec:.0f}s audio)")
 
-    events = _detect_spikes(rms_values, window_sec)
+    events = _detect_spikes(rms_values, window_sec, speech_regions=speech_regions)
     clusters = _cluster_events(events, window_sec)
 
     if clusters:

@@ -282,7 +282,7 @@ def openrouter(
     api_key: str,
     model: str = DEFAULT_OPENROUTER_MODEL,
     base_url: str = DEFAULT_OPENROUTER_BASE,
-    enable_reasoning: bool = True,
+    enable_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Call OpenRouter (OpenAI-compatible API).
@@ -516,7 +516,7 @@ def call_llm(
     user: str,
     api_key: str | None = None,
     llm_model: str | None = None,
-    enable_reasoning: bool = True,
+    enable_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Call the best available LLM backend and return raw parsed clips.
@@ -528,10 +528,10 @@ def call_llm(
       4. Ollama      (local, no key needed)
 
     Args:
-        enable_reasoning: When True (default), OpenRouter calls will request
+        enable_reasoning: When True, OpenRouter calls will request
             extended reasoning from the model.  If the model does not support
             it the call is transparently retried without reasoning.  Set to
-            False to always skip reasoning (saves tokens / latency).
+            False (default) to skip reasoning (better consistency, lower cost/latency).
     """
     or_key = api_key or os.getenv("OPENROUTER_API_KEY")
     ant_key = os.getenv("ANTHROPIC_API_KEY")

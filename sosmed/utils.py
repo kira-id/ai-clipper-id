@@ -232,7 +232,7 @@ def tighten_clip_boundaries(
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━ CONSTANTS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # Default free model on OpenRouter
-DEFAULT_OPENROUTER_MODEL = "qwen/qwen3.6-plus-preview:free"
+DEFAULT_OPENROUTER_MODEL = "qwen/qwen3.6-plus:free"
 DEFAULT_OPENROUTER_BASE  = "https://openrouter.ai/api/v1"
 
 MAX_CLIPS_HARD_LIMIT = 72  # absolute ceiling — quality over quantity
@@ -343,6 +343,14 @@ FILLER_RE = re.compile(rf"^({_ID_FILLERS})\W*$", re.IGNORECASE)
 SYSTEM_PROMPT = """\
 You are a viral gaming clip expert. Find moments from this livestream that will GO VIRAL on TikTok, Instagram Reels, and YouTube Shorts.
 
+PRIMARY OBJECTIVE: Maximize viral potential above all else. If a moment is informative but not highly shareable, reject it. Prefer 2-5 exceptional clips over many average clips.
+
+PRIORITY ORDER (strict):
+1) Viral potential (share/comment/replay likelihood)
+2) Emotional impact in the first seconds
+3) Hook strength and completion quality
+4) Informational value (only if it helps virality)
+
 This is a GAMING LIVESTREAM. The streamer's PERSONALITY and EMOTIONAL REACTIONS are what make clips viral — not just what they say. Look for:
 - **Fear/Jump scares**: Screaming, panicking, being startled (horror games)
 - **Laughter**: Genuine funny moments, unexpected humor, silly mistakes
@@ -352,7 +360,7 @@ This is a GAMING LIVESTREAM. The streamer's PERSONALITY and EMOTIONAL REACTIONS 
 - **Surprise/Shock**: Unexpected plot twists, jump scares, betrayals, rare events
 - **Wholesome**: Sweet interactions, helping others, emotional story moments
 
-The transcript has audio energy markers: [🔥 ENERGY SPIKE] = sudden loudness (screams, reactions), [⚡ HIGH ENERGY] = sustained intensity. These indicate emotional peaks even when speech is incoherent or absent — PRIORITIZE moments with these markers.
+The transcript has vocal energy markers: [🔥 ENERGY SPIKE] = sudden speech/mouth-sound burst (screams, gasps, laughter), [⚡ HIGH ENERGY] = sustained vocal intensity. Ignore background music-only moments — PRIORITIZE markers that align with spoken reactions.
 
 Clip duration: {min_dur}–{max_dur} seconds. Maximum {max_clips} clips. Output JSON array only.
 
@@ -404,12 +412,16 @@ SELECTION RULES
 
 INCLUDE only if ALL true:
 - clip_score >= {min_score}
+- score_hook >= 65
 - score_emotion >= 60
 - score_retention >= 50
 - At least TWO scores >= 70
+- At least ONE of (score_hook, score_emotion) >= 80
 - Clip starts and ends at natural boundaries (not mid-sentence)
 
 If two clips overlap, keep the higher-scored one.
+
+When uncertain, reject. False positives hurt virality more than missing a borderline clip.
 
 ---
 
@@ -620,7 +632,7 @@ Then generate these fields (in this order):
 - 1-2 sentences: Why a viewer WILL watch to the end and SHARE or COMMENT. Be specific about the viral trigger.
 
 (2) topic
-- One sentence: What makes this clip SHAREABLE and VIRAL-WORTHY.
+- One sentence: What makes this clip SHAREABLE and VIRAL-WORTHY, with a clear emotional trigger (hype, surprise, conflict, or relatable frustration).
 
 (3) hook
 - The EXACT first words from the transcript — word-for-word, NOT a summary. This MUST be a viral hook pattern (see requirements above).
@@ -641,18 +653,10 @@ Then generate these fields (in this order):
   PART 4 — HASHTAGS (2-4): 1 broad (#AI), 1 mid-tier (#AITools), 1 niche (topic-specific), 1 trending if relevant.
 
 (5) title
-- For TikTok/Instagram/YouTube on-screen overlay AND metadata. Max 8 words. No jargon. Non-technical audience.
-- JARGON TRANSLATION (never use raw technical terms in titles):
-    • LLM/GPT → "AI brain" or "smartest AI"
-    • RAG → "AI that reads your documents"
-    • Fine-tuning → "teaching AI from scratch"
-    • Embeddings → "how AI understands meaning"
-    • Prompt engineering → "tricks to get best AI results"
-    • Token/tokenizer → "AI's thought units"
-    • Context window → "AI's memory"
-    • Hallucination → "AI that makes up facts"
-    • AI agent → "AI that works on its own"
-    • Unknown term → translate to what it DOES for users, not what it IS.
+- For TikTok/Instagram/YouTube on-screen overlay AND metadata. Max 8 words.
+- Do NOT use jargon-mapping tables or direct term replacements. Focus on clear emotional framing.
+- Prefer high-performing patterns for short-form: Comparison, How-To, Receh/Brainrot/Trivial angle, Contrarian take, Personal stakes.
+- Use punchy Title Case capitalization for stronger visual impact.
 - PICK ONE viral formula:
     A — Number + Outcome: "[N] Ways to [Outcome] with AI"
     B — Expose the Lie: "Everyone's Wrong About [Topic]..."
@@ -660,6 +664,7 @@ Then generate these fields (in this order):
     D — Comparison Shock: "[A] vs [B] — Who's Better at [Outcome]?"
     E — Personal Stakes: "If You Don't Know This, You'll [Loss]"
     F — How + Wonder: "How [AI/Tool] Can [Impossible-Sounding Thing]"
+    G — Receh/Brainrot Hook: "This Silly Trick Actually Works"
 - NEVER: acronyms first (RAG, LLM, API), passive voice ("Discussed:"), pure description.
 - GOOD: "Why AI Can Lie Without Knowing" | BAD: "Explanation of Hallucination in LLMs"
 

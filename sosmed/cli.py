@@ -520,7 +520,7 @@ def main() -> None:
         sys.exit(1)
 
     # ── 2b. Audio energy analysis ─────────────────────────────────────────
-    energy_events = analyze_audio_energy(str(video))
+    energy_events = analyze_audio_energy(str(video), segments=filtered)
 
     # ── 3. LLM analysis ─────────────────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)

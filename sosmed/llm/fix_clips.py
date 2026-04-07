@@ -1,6 +1,4 @@
-"""
-"""Fix and improve clips: translate to English, fix caption-topic mismatches, deduplicate topics.
-"""
+"""Fix and improve clips: translate to English, fix caption-topic mismatches, deduplicate topics."""
 
 import json
 from typing import Any
@@ -242,7 +240,7 @@ def _improve_and_deduplicate(
     clips_json = json.dumps(clips, ensure_ascii=False, indent=2)
     user_message = f"{prompt_text}\n\nClips:\n{clips_json}"
 
-    system_message = "You are an expert social media strategist optimizing video clips for viral engagement."
+    system_message = "You are an expert social media strategist. Optimize strictly for virality first (shares/comments/replays), not completeness or neutral informativeness."
     result = None
     for attempt in range(max_retries + 1):
         try:
