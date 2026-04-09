@@ -14,16 +14,27 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_defaults
-from .music import build_music_filter
+from .music import build_music_filter, choose_music_start_offset
 from .subtitles import generate_ass_subtitles, generate_title_overlay
 from .utils import get_ffmpeg, get_ffprobe, log
 
 
 def _escape_ass_path(path: str) -> str:
-    """Escape file path for FFmpeg's libass subtitle filter in filter_complex."""
-    escaped = path.replace("\\", "\\\\")
-    for ch in ":'[];,":
+    """Escape file path for FFmpeg's libass subtitle filter in filter_complex.
+
+    FFmpeg filter parsing is sensitive to separators and special characters.
+    In filter_complex, Windows drive colon needs double escaping so it survives
+    both graph and filter-option parsing (e.g. ``C\\\\:/Users/.../file.ass``).
+    """
+    escaped = path.replace("\\", "/")
+
+    # Escape Windows drive-letter colon only (C: -> C\\:).
+    if len(escaped) >= 2 and escaped[1] == ":" and escaped[0].isalpha():
+        escaped = f"{escaped[0]}\\\\:{escaped[2:]}"
+
+    for ch in "'[];, ":
         escaped = escaped.replace(ch, f"\\{ch}")
+
     return escaped
 
 
@@ -162,7 +173,7 @@ def _postprocess_one(
     enable_split_screen: bool = False,
     enable_music: bool = False,
     music_entry: dict[str, str] | None = None,
-    music_volume: float = 0.06,
+    music_volume: float = 0.08,
     enable_silence_removal: bool = False,
     max_silence: float = 1.5,
     cta_config: dict[str, Any] | None = None,
@@ -362,8 +373,20 @@ def _postprocess_one(
 
     # Extra inputs (music)
     music_input_idx = None
+    music_start_offset = 0.0
     if enable_music and music_entry and Path(music_entry.get("file", "")).exists():
         music_file = music_entry["file"]
+        music_seed = "|".join([
+            str(clip.get("rank", "")),
+            str(clip.get("title", "")),
+            str(clip.get("topic", "")),
+            str(clip.get("start", "")),
+            str(clip.get("end", "")),
+            str(music_entry.get("id", "")),
+        ])
+        music_start_offset = choose_music_start_offset(music_file, clip_duration, seed_source=music_seed)
+        if music_start_offset > 0:
+            log("DEBUG", f"Clip #{clip.get('rank')}: music start offset {music_start_offset:.2f}s ({Path(music_file).name})")
         cmd.extend(["-stream_loop", "-1", "-i", music_file])
         music_input_idx = 1  # second input
 
@@ -473,7 +496,12 @@ def _postprocess_one(
             # Mix with background music
             filter_parts.append(f"{current_a_label}{afilter_str}[voice]")
 
-            filter_parts.append(build_music_filter(music_input_idx, clip_duration, music_volume))
+            filter_parts.append(build_music_filter(
+                music_input_idx,
+                clip_duration,
+                music_start_offset,
+                music_volume,
+            ))
             filter_parts.append("[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]")
         else:
             filter_parts.append(f"{current_a_label}{afilter_str}[aout]")
@@ -592,7 +620,7 @@ def postprocess_clips(
     enable_split_screen: bool = False,
     enable_music: bool = False,
     music_entries: dict[int, dict[str, str]] | None = None,
-    music_volume: float = 0.06,
+    music_volume: float = 0.08,
     enable_silence_removal: bool = False,
     max_silence: float = 1.5,
     cta_config: dict[str, Any] | None = None,

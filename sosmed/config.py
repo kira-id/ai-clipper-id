@@ -72,7 +72,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     ],
     "defaults": {
         "whisper_model": "turbo",
-        "language": "id",
+        "language": "en",
         "min_clip_duration": 15,
         "max_clip_duration": 180,
         "max_clips": 10,
@@ -91,7 +91,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "subtitle_margin_pct": 25.0,  # 25% from bottom for "lower" position
         "music_enabled": False,
         "music_dir": "music",
-        "music_volume": 0.06,
+        "music_volume": 0.20,
         "silence_removal_enabled": True,
         "max_silence_duration": 1.5,
         "encoding_preset": "veryfast",  # ffmpeg x264 preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
@@ -108,6 +108,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "username": "@samuelkoesnadi",
         "duration": 3.0,
         "fade_duration": 0.5,
+    },
+    "openrouter": {
+        "model": "arcee-ai/trinity-large-preview:free",
+        "base_url": "https://openrouter.ai/api/v1",
     },
 }
 
@@ -202,6 +206,12 @@ def get_cta_settings() -> dict[str, Any]:
     """Get Instagram CTA settings."""
     config = load_config()
     return config.get("cta", DEFAULT_CONFIG["cta"])
+
+
+def get_openrouter_settings() -> dict[str, Any]:
+    """Get OpenRouter LLM settings."""
+    config = load_config()
+    return config.get("openrouter", DEFAULT_CONFIG["openrouter"])
 
 
 def reload_config() -> dict[str, Any]:

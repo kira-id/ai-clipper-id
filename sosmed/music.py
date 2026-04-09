@@ -3,20 +3,20 @@ Background music selection and mixing for video clips.
 
 Uses a curated library of royalty-free music organized by mood/category.
 LLM matches clip content to appropriate background music.
-Music is mixed at very low volume as ambient vibe.
+Music is mixed at very low volume as ambient vibe, with a fade-out at the
+end of the clip.
 """
 
+import hashlib
 import json
-import os
 import subprocess
 import tempfile
+from array import array
 from pathlib import Path
 from typing import Any
 
-import requests
-
 from .utils import get_ffmpeg, log
-from .config import get_music_library, get_pixabay_settings
+from .config import get_music_library
 
 
 # ── Royalty-free music library ───────────────────────────────────────────────
@@ -25,13 +25,149 @@ from .config import get_music_library, get_pixabay_settings
 MUSIC_LIBRARY: list[dict[str, str]] = get_music_library()
 
 
-# ── Pixabay search queries per music category ──────────────────────────────
-# Maps each library entry to a Pixabay search query + category filter.
-# Auto-generated from music library IDs.
-_PIXABAY_QUERIES: dict[str, dict[str, str]] = {
-    entry["id"]: {"q": entry["id"].replace("_", " ") + " " + entry.get("category", ""), "category": "music"}
-    for entry in MUSIC_LIBRARY
-}
+def get_media_duration(media_path: str | Path) -> float:
+    """Return the duration of a media file in seconds."""
+    from .utils import get_ffprobe
+
+    try:
+        result = subprocess.run(
+            [
+                get_ffprobe(), "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "json",
+                str(media_path),
+            ],
+            capture_output=True, text=True, check=True,
+        )
+        return float(json.loads(result.stdout).get("format", {}).get("duration", 0))
+    except Exception as e:
+        log("WARN", f"Could not determine duration for {media_path}: {e}")
+        return 0.0
+
+
+def choose_music_start_offset(
+    music_path: str | Path,
+    clip_duration: float,
+    seed_source: str | None = None,
+) -> float:
+    """Pick a stable start offset inside a music track.
+
+    The offset is biased away from the opening intro and ending tail so the
+    chosen section is less likely to sound like the very beginning of the
+    track. The exact section is deterministic for a given music file and
+    seed, which keeps reruns stable.
+    """
+    music_duration = get_media_duration(music_path)
+    if music_duration <= 0:
+        return 0.0
+
+    intro_buffer = min(10.0, music_duration * 0.12)
+    outro_buffer = min(10.0, music_duration * 0.12)
+    usable_duration = music_duration - intro_buffer - outro_buffer
+    if usable_duration <= 0:
+        return 0.0
+
+    # Keep enough tail so the selected section can cover the whole clip.
+    # This avoids late starts that can make the music end early in output.
+    max_start_offset = max(0.0, music_duration - max(0.0, clip_duration))
+    if max_start_offset <= 0:
+        return 0.0
+
+    effective_min = min(intro_buffer, max_start_offset)
+    effective_max = min(intro_buffer + usable_duration, max_start_offset)
+    if effective_max <= effective_min:
+        return effective_min
+
+    seed = f"{Path(music_path).as_posix()}|{clip_duration:.3f}|{seed_source or ''}"
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    fraction = int.from_bytes(digest[:8], "big") / 2**64
+    base_offset = effective_min + (fraction * (effective_max - effective_min))
+
+    # Sample multiple deterministic candidates and choose the loudest section
+    # so background music remains audible even when some regions are very quiet.
+    offsets = _build_music_offset_candidates(base_offset, effective_min, effective_max)
+    analysis_window = min(8.0, max(2.0, clip_duration * 0.25))
+
+    best_offset = offsets[0]
+    best_rms = -1.0
+    for off in offsets:
+        rms = _compute_audio_window_rms(music_path, off, analysis_window)
+        if rms > best_rms:
+            best_rms = rms
+            best_offset = off
+
+    return best_offset
+
+
+def _build_music_offset_candidates(
+    base_offset: float,
+    min_offset: float,
+    max_offset: float,
+) -> list[float]:
+    """Build deterministic candidate offsets within the usable range."""
+    if max_offset <= min_offset:
+        return [max(0.0, min_offset)]
+
+    span = max_offset - min_offset
+    rel_base = base_offset - min_offset
+    # Spread probes across the track to avoid landing on an unusually quiet spot.
+    shifts = [0.0, 0.21, 0.43, 0.67]
+    candidates: list[float] = []
+    for s in shifts:
+        rel = (rel_base + span * s) % span
+        candidates.append(min_offset + rel)
+    return candidates
+
+
+def _compute_audio_window_rms(
+    media_path: str | Path,
+    start_offset: float,
+    window_duration: float,
+) -> float:
+    """Compute RMS for a short audio window using ffmpeg PCM output."""
+    if window_duration <= 0:
+        return 0.0
+
+    try:
+        result = subprocess.run(
+            [
+                get_ffmpeg(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                f"{max(0.0, start_offset):.3f}",
+                "-t",
+                f"{window_duration:.3f}",
+                "-i",
+                str(media_path),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-f",
+                "s16le",
+                "-",
+            ],
+            capture_output=True,
+            check=True,
+        )
+    except Exception:
+        return 0.0
+
+    if not result.stdout:
+        return 0.0
+
+    samples = array("h")
+    samples.frombytes(result.stdout)
+    if not samples:
+        return 0.0
+
+    sum_sq = 0.0
+    for s in samples:
+        sum_sq += float(s) * float(s)
+    return (sum_sq / len(samples)) ** 0.5
 
 
 def download_music_library(
@@ -39,131 +175,13 @@ def download_music_library(
     api_key: str | None = None,
     min_duration: int | None = None,
 ) -> list[str]:
-    """Download copyright-free music from Pixabay for each mood category.
+    """Pixabay download is intentionally disabled.
 
-    Pixabay music is 100% royalty-free, no attribution required, safe for
-    commercial use including YouTube, TikTok, etc.
-
-    Get a free API key at: https://pixabay.com/api/docs/
-
-    Args:
-        music_dir: Directory to save music files into.
-        api_key: Pixabay API key. Falls back to PIXABAY_API_KEY env var.
-        min_duration: Minimum track duration in seconds. If None, uses config.
-
-    Returns:
-        List of downloaded file paths.
+    Music is expected to come from local files, primarily assets/background_music.mp3.
     """
-    api_key = api_key or os.environ.get("PIXABAY_API_KEY", "")
-    if not api_key:
-        log("ERROR", "Pixabay API key required for music download. "
-                      "Get a free key at https://pixabay.com/api/docs/ "
-                      "then set PIXABAY_API_KEY env var.")
-        return []
-
-    music_path = Path(music_dir)
-    music_path.mkdir(parents=True, exist_ok=True)
-
-    # Load Pixabay settings from config
-    pixabay_settings = get_pixabay_settings()
-    if min_duration is None:
-        min_duration = pixabay_settings.get("min_duration", 30)
-    per_page = pixabay_settings.get("per_page", 5)
-
-    downloaded: list[str] = []
-
-    for entry in MUSIC_LIBRARY:
-        mid = entry["id"]
-        target_file = music_path / f"{mid}.mp3"
-
-        # Skip if already downloaded
-        if target_file.exists() and target_file.stat().st_size > 10_000:
-            log("OK", f"  {mid}: already exists ({target_file.stat().st_size // 1024} KB)")
-            downloaded.append(str(target_file))
-            continue
-
-        query_info = _PIXABAY_QUERIES.get(mid)
-        if not query_info:
-            log("WARN", f"  {mid}: no search query defined, skipping")
-            continue
-
-        # Search Pixabay audio API
-        try:
-            resp = requests.get(
-                "https://pixabay.com/api/",
-                params={
-                    "key": api_key,
-                    "q": query_info["q"],
-                    "media_type": "music",
-                    "per_page": per_page,
-                    "min_duration": min_duration,
-                    "order": "popular",
-                    "editors_choice": "true",
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            # Try without editors_choice filter
-            try:
-                resp = requests.get(
-                    "https://pixabay.com/api/",
-                    params={
-                        "key": api_key,
-                        "q": query_info["q"],
-                        "media_type": "music",
-                        "per_page": per_page,
-                        "min_duration": min_duration,
-                        "order": "popular",
-                    },
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as e2:
-                log("WARN", f"  {mid}: Pixabay search failed: {e2}")
-                continue
-
-        hits = data.get("hits", [])
-        if not hits:
-            log("WARN", f"  {mid}: no results for query '{query_info['q']}'")
-            continue
-
-        # Pick the first (most popular) hit
-        hit = hits[0]
-        audio_url = hit.get("audio") or hit.get("previewURL") or ""
-        if not audio_url:
-            # Try alternative URL fields
-            for h in hits:
-                audio_url = h.get("audio") or h.get("previewURL") or ""
-                if audio_url:
-                    hit = h
-                    break
-
-        if not audio_url:
-            log("WARN", f"  {mid}: no download URL found")
-            continue
-
-        # Download the audio file
-        try:
-            log("INFO", f"  {mid}: downloading '{hit.get('title', 'unknown')}'...")
-            audio_resp = requests.get(audio_url, timeout=60, stream=True)
-            audio_resp.raise_for_status()
-
-            with open(target_file, "wb") as f:
-                for chunk in audio_resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            size_kb = target_file.stat().st_size // 1024
-            log("OK", f"  {mid}: downloaded ({size_kb} KB) → {target_file}")
-            downloaded.append(str(target_file))
-        except Exception as e:
-            log("WARN", f"  {mid}: download failed: {e}")
-            if target_file.exists():
-                target_file.unlink()
-
-    return downloaded
+    _ = (music_dir, api_key, min_duration)
+    log("INFO", "Pixabay music download is disabled. Using local music files only.")
+    return []
 
 
 def get_available_music(music_dir: str | Path | None = None) -> list[dict[str, str]]:
@@ -329,7 +347,8 @@ def match_music_batch(
 def build_music_filter(
     music_idx: int,
     clip_duration: float,
-    volume: float = 0.06,
+    start_offset: float = 0.0,
+    volume: float = 0.20,
 ) -> str:
     """Build FFmpeg filter string for the background music stream.
 
@@ -339,7 +358,8 @@ def build_music_filter(
     Args:
         music_idx: FFmpeg input index of the music file (e.g. 1 for second -i).
         clip_duration: Duration of the clip in seconds.
-        volume: Music volume (0.0–1.0), default 0.06 (very quiet).
+        start_offset: Start position inside the music stream in seconds.
+        volume: Music volume (0.0–1.0), default 0.20.
 
     Returns:
         Filter string to include in filter_complex.
@@ -347,11 +367,13 @@ def build_music_filter(
     fade_in = min(1.0, clip_duration * 0.1)
     fade_out = min(2.0, clip_duration * 0.15)
     fade_out_start = max(0, clip_duration - fade_out)
+    trim_start = max(0.0, start_offset)
+    trim_end = trim_start + max(0.0, clip_duration)
 
     return (
         f"[{music_idx}:a]"
         f"aloop=loop=-1:size=2e+09,"
-        f"atrim=0:{clip_duration:.3f},"
+        f"atrim={trim_start:.3f}:{trim_end:.3f},"
         f"asetpts=PTS-STARTPTS,"
         f"afade=t=in:st=0:d={fade_in:.2f},"
         f"afade=t=out:st={fade_out_start:.2f}:d={fade_out:.2f},"
@@ -364,7 +386,7 @@ def apply_music_to_clip(
     clip_path: str,
     output_path: str,
     music_path: str,
-    music_volume: float = 0.06,
+    music_volume: float = 0.20,
 ) -> bool:
     """Mix background music into an existing video clip.
 
@@ -376,32 +398,14 @@ def apply_music_to_clip(
         clip_path: Input video file path.
         output_path: Output video file path (can be same as input).
         music_path: Background music file path.
-        music_volume: Music volume (0.0–1.0). Default 0.06 (very quiet).
+        music_volume: Music volume (0.0–1.0). Default 0.20.
 
     Returns:
         True on success, False on failure.
     """
-    import json
     import tempfile
 
-    from .utils import get_ffprobe
-
-    # Get clip duration via ffprobe
-    try:
-        result = subprocess.run(
-            [
-                get_ffprobe(), "-v", "error",
-                "-show_entries", "format=duration",
-                "-of", "json",
-                clip_path,
-            ],
-            capture_output=True, text=True, check=True,
-        )
-        duration = float(json.loads(result.stdout).get("format", {}).get("duration", 0))
-    except Exception as e:
-        log("WARN", f"Could not determine duration for {clip_path}: {e}")
-        return False
-
+    duration = get_media_duration(clip_path)
     if duration <= 0:
         log("WARN", f"Zero duration for {clip_path}, skipping music")
         return False
@@ -409,8 +413,11 @@ def apply_music_to_clip(
     # Speech-optimized: -13 LUFS, LRA=7 for tight, clear narration
     # No pre-amp — source audio already has good levels
     voice_filter = "[0:a]loudnorm=I=-13:LRA=7:TP=-1.0[voice]"
-    music_filter = build_music_filter(1, duration, music_volume)
+    music_start_offset = choose_music_start_offset(music_path, duration, seed_source=clip_path)
+    music_filter = build_music_filter(1, duration, music_start_offset, music_volume)
     mix_filter = "[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]"
+    if music_start_offset > 0:
+        log("DEBUG", f"Using music start offset {music_start_offset:.2f}s for {Path(music_path).name}")
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_out = tmp.name

@@ -59,26 +59,22 @@ def _prepare_music(clips, args):
     if not args.music:
         return {}
 
-    from .music import get_available_music, download_music_library, match_music_batch
+    from .music import get_available_music, match_music_batch
     music_dir = getattr(args, 'music_dir', None) or "music"
+    assets_music = Path(__file__).parent.parent / "assets" / "background_music.mp3"
+    if assets_music.exists():
+        log("INFO", f"Using background music from assets: {assets_music}")
+        selected = {
+            "id": "background_music",
+            "file": str(assets_music),
+            "description": "Background music",
+            "mood": "neutral",
+        }
+        return {c.get("rank", 0): selected for c in clips}
+
     available = get_available_music(music_dir)
-
     if not available:
-        log("INFO", "No music files found — attempting auto-download from Pixabay...")
-        downloaded = download_music_library(music_dir=music_dir)
-        if downloaded:
-            log("OK", f"Downloaded {len(downloaded)} music tracks")
-            available = get_available_music(music_dir)
-
-    if not available:
-        assets_music = Path(__file__).parent.parent / "assets" / "background_music.mp3"
-        if assets_music.exists():
-            log("INFO", f"Using fallback background music from assets: {assets_music}")
-            fallback = {"id": "background_music", "file": str(assets_music), "description": "Background music", "mood": "neutral"}
-            return {c.get("rank", 0): fallback for c in clips}
-        log("WARN", "No background music files found. "
-                     "Set PIXABAY_API_KEY env var to auto-download, "
-                     "or place .mp3 files in music/ directory. Skipping music.")
+        log("WARN", "No background music files found. Place .mp3 files in music/ or add assets/background_music.mp3. Skipping music.")
         return {}
 
     log("INFO", f"Matching background music for {len(clips)} clips "
@@ -240,7 +236,7 @@ def main() -> None:
     # ── Background music ─────────────────────────────────────────────────
     ap.add_argument("--music", action=argparse.BooleanOptionalAction,
                     default=defaults["music_enabled"],
-                    help=f"Add background music matched to clip mood "
+                    help=f"Add background music matched to clip mood with a fade-out at the end "
                          f"(default: {'on' if defaults['music_enabled'] else 'off'})")
     ap.add_argument("--music-dir", default=defaults["music_dir"],
                     help=f"Directory containing music files (default: ./{defaults['music_dir']}/)")
@@ -268,10 +264,6 @@ def main() -> None:
                     default=_cta_defaults.get("enabled", False),
                     help="Append Instagram follow CTA at the end of each clip "
                          f"(default: {'on' if _cta_defaults.get('enabled') else 'off'})")
-
-    # ── Caching & skip options ───────────────────────────────────────────
-    ap.add_argument("--skip-existing", action="store_true",
-                    help="Skip processing if final output file already exists")
 
     # ── Testing options ──────────────────────────────────────────────────
     ap.add_argument("--example", action="store_true",
@@ -424,29 +416,6 @@ def main() -> None:
         sys.exit(1)
 
     output_dir = Path(args.output) / video.stem
-
-    # ── Check for existing output ───────────────────────────────────────────
-    if args.skip_existing:
-        clips_json = output_dir / "all_clips.json"
-        if not clips_json.exists():
-            clips_json = output_dir / "clips.json"
-        if clips_json.exists():
-            clips_data = json.loads(clips_json.read_text())
-            if clips_data:
-                final_filename = clips_data[0].get("filename")
-                if final_filename:
-                    final_file = output_dir / final_filename
-                    if final_file.exists():
-                        log("OK", f"Output already exists: {final_file}")
-                        log("OK", "Skipping processing (use without --skip-existing to force re-run)")
-                        best_clip = clips_data[0]
-                        print(f"\n{GREEN}{BOLD}✓ Complete!{RESET}")
-                        print(f"  Output: {final_file}")
-                        print()
-                        print(f"{BOLD}Topic:{RESET} {best_clip.get('topic', 'N/A')}")
-                        print(f"{BOLD}Title:{RESET} {best_clip.get('title', 'N/A')}")
-                        print(f"{BOLD}Caption:{RESET} {best_clip.get('caption', 'N/A')}")
-                        return
 
     print(f"\n{BOLD}{CYAN}{'═' * 50}")
     print(f"   AI Video Clipper — English-optimized")

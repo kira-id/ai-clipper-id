@@ -9,6 +9,7 @@ import sys
 import time
 from typing import Any, Callable
 
+from ..config import get_openrouter_settings
 from ..utils import log, BOLD, RESET, DEFAULT_OPENROUTER_MODEL, DEFAULT_OPENROUTER_BASE
 
 
@@ -538,8 +539,11 @@ def call_llm(
     oai_key = os.getenv("OPENAI_API_KEY")
 
     if or_key:
-        model = llm_model or os.getenv("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL)
-        return openrouter(system, user, or_key, model=model, enable_reasoning=enable_reasoning)
+        # Priority: explicit param → env var → config → default
+        or_settings = get_openrouter_settings()
+        model = llm_model or os.getenv("OPENROUTER_MODEL") or or_settings.get("model", DEFAULT_OPENROUTER_MODEL)
+        base_url = or_settings.get("base_url", DEFAULT_OPENROUTER_BASE)
+        return openrouter(system, user, or_key, model=model, base_url=base_url, enable_reasoning=enable_reasoning)
     elif ant_key:
         return anthropic(system, user, ant_key)
     elif oai_key:
