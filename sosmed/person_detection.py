@@ -414,102 +414,76 @@ def build_dynamic_crop_filter(
     zoom_y = crop_h / src_h
     zoom = min(zoom_x, zoom_y)
 
-    # Build expressions for each keyframe
-    # Format: 'if(lte(X,{time}),{x_expr},{next_x_expr})'
-    expressions = []
+    # Build time-keyed keyframes of the crop window's TOP-LEFT corner. We drive
+    # ffmpeg's `crop` filter directly (x/y accept per-frame expressions) rather
+    # than `zoompan`. zoompan re-derives its own zoom/scale state and its
+    # `primary`/`interp` options are not accepted by all ffmpeg builds, which
+    # made the previous filter graph fail to parse outright.
+    max_x = max(0, src_w - crop_w)
+    max_y = max(0, src_h - crop_h)
 
-    for i, region in enumerate(crop_regions):
-        t = region["time"]
-        x = region["x"]
-        y = region["y"]
+    keys_x: list[tuple[float, float]] = []
+    keys_y: list[tuple[float, float]] = []
+    for region in crop_regions:
+        t = float(region["time"])
+        keys_x.append((t, min(max(0.0, float(region["x"])), float(max_x))))
+        keys_y.append((t, min(max(0.0, float(region["y"])), float(max_y))))
 
-        # Convert crop coordinates to zoompan coordinates
-        # zoompan x/y are the center point of the zoom window
-        cx = x + crop_w / 2
-        cy = y + crop_h / 2
+    x_expr = _build_interpolation_expr(keys_x)
+    y_expr = _build_interpolation_expr(keys_y)
 
-        expressions.append({
-            "time": t,
-            "cx": cx,
-            "cy": cy,
-            "zoom": zoom,
-        })
+    # Commas and single quotes are filter-graph separators. Escape every comma
+    # inside the expressions so the whole `if(...)` tree survives ffmpeg's
+    # two-stage (graph, then filter-option) parser.
+    x_expr = x_expr.replace(",", "\\,")
+    y_expr = y_expr.replace(",", "\\,")
 
-    # Build nested if-else expression for smooth interpolation
-    # zoompan will interpolate between keyframes
-    if len(expressions) == 1:
-        # Single keyframe: constant position
-        expr = f"z={zoom:.4f}:x={expressions[0]['cx']}:y={expressions[0]['cy']}:d=1"
-    else:
-        # Multiple keyframes: build interpolation expression
-        # Use zoompan with linear interpolation between keyframes
-        # d=1 means each keyframe lasts 1 frame, zoompan interpolates
-        keyframes = []
-        for i, exp in enumerate(expressions):
-            dur = 1
-            if i < len(expressions) - 1:
-                # Duration until next keyframe (in frames, assuming 30fps)
-                next_t = expressions[i + 1]["time"]
-                dur = max(1, int((next_t - exp["time"]) * 30))
-            keyframes.append(f"if(between(n,{int(exp['time']*30)},{int(exp['time']*30)+dur}),{exp['cx']},{exp['cy']},{exp['zoom']})")
-
-        # Simpler approach: use zoompan with static zoom and interpolated x/y
-        # Build expression that selects the appropriate target position based on frame number
-        x_expr = _build_interpolation_expr([(e["time"], e["cx"]) for e in expressions], fps=30)
-        y_expr = _build_interpolation_expr([(e["time"], e["cy"]) for e in expressions], fps=30)
-        expr = f"z={zoom:.4f}:x={x_expr}:y={y_expr}:d=1:primary=1:interp=linear"
-
-    # zoompan filter: zooms and pans, then we scale to final output size
-    return f"zoompan={expr}:s={target_w}x{target_h}"
+    return (
+        f"crop={crop_w}:{crop_h}:x={x_expr}:y={y_expr},"
+        f"scale={target_w}:{target_h}:flags=lanczos,setsar=1"
+    )
 
 
 def _build_interpolation_expr(
     keyframes: list[tuple[float, float]],
-    fps: int = 30,
 ) -> str:
-    """Build FFmpeg expression for linear interpolation between keyframes.
+    """Build an FFmpeg expression that linearly interpolates between keyframes.
+
+    Uses the timeline variable ``t`` (seconds) rather than the frame counter
+    ``n`` so the result is correct at any frame rate. The previous version
+    hardcoded 30fps, so tracking drifted badly on 25/50/60fps sources.
 
     Args:
         keyframes: List of (time_seconds, value) tuples
-        fps: Frames per second
 
     Returns:
-        FFmpeg expression string using nested if-else for interpolation
+        FFmpeg expression string using nested if() for piecewise interpolation.
     """
     if not keyframes:
         return "0"
     if len(keyframes) == 1:
-        return str(keyframes[0][1])
+        return f"{keyframes[0][1]:.2f}"
 
-    # Sort by time
-    keyframes = sorted(keyframes, key=lambda x: x[0])
+    keyframes = sorted(keyframes, key=lambda kv: kv[0])
 
-    # Build nested if expression
-    # Format: if(lte(n, {frame_n}), {value_or_interp}, {next_if})
-    exprs = []
+    exprs: list[str] = []
     for i in range(len(keyframes) - 1):
         t1, v1 = keyframes[i]
         t2, v2 = keyframes[i + 1]
-        n1 = int(t1 * fps)
-        n2 = int(t2 * fps)
 
-        if n2 == n1:
-            # Same frame, use v1
-            exprs.append(f"if(lte(n,{n1}),{v1:.1f},")
-        else:
-            # Linear interpolation: v1 + (v2-v1)*(n-n1)/(n2-n1)
-            slope = (v2 - v1) / (n2 - n1) if n2 != n1 else 0
-            interp = f"{v1:.1f}+{slope:.4f}*(n-{n1})"
-            exprs.append(f"if(lte(n,{n2}),{interp},")
+        if t2 <= t1:
+            # Duplicate / non-monotonic timestamp — hold the earlier value.
+            exprs.append(f"if(lte(t,{t1:.3f}),{v1:.2f},")
+            continue
 
-    # Last keyframe value
-    last_n = int(keyframes[-1][0] * fps)
-    last_v = keyframes[-1][1]
-    exprs.append(str(last_v))
+        slope = (v2 - v1) / (t2 - t1)
+        interp = f"{v1:.2f}+({slope:.4f})*(t-{t1:.3f})"
+        exprs.append(f"if(lte(t,{t2:.3f}),{interp},")
 
-    # Close parentheses
-    expr = "".join(exprs) + ")" * (len(exprs) - 1)
-    return expr
+    # Past the final keyframe: hold the last value.
+    exprs.append(f"{keyframes[-1][1]:.2f}")
+
+    return "".join(exprs) + ")" * (len(exprs) - 1)
 
 
 def build_split_screen_filter(

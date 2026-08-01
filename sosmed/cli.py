@@ -3,6 +3,7 @@ CLI interface: argument parsing and orchestration.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -19,7 +20,8 @@ from .postprocess import postprocess_clips
 from .utils import (
     log, BOLD, RESET, CYAN, GREEN, YELLOW,
     MAX_CLIPS_HARD_LIMIT,
-    save_clips_to_disk, load_clips_with_internal_fields
+    save_clips_to_disk, load_clips_with_internal_fields,
+    get_clips_cache_dir,
 )
 from .smart_clip_boundaries import smart_adjust_clip_boundaries
 from .audio_energy import analyze_audio_energy
@@ -54,69 +56,116 @@ def _ensure_filenames(clips_list: list[dict]) -> bool:
     return changed
 
 
-def _prepare_music(clips, args):
-    """Prepare background music entries for clips if music is enabled."""
-    if not args.music:
-        return {}
-
-    from .music import get_available_music, match_music_batch
-    music_dir = getattr(args, 'music_dir', None) or "music"
-    assets_music = Path(__file__).parent.parent / "assets" / "background_music.mp3"
-    if assets_music.exists():
-        log("INFO", f"Using background music from assets: {assets_music}")
-        selected = {
-            "id": "background_music",
-            "file": str(assets_music),
-            "description": "Background music",
-            "mood": "neutral",
-        }
-        return {c.get("rank", 0): selected for c in clips}
-
-    available = get_available_music(music_dir)
-    if not available:
-        log("WARN", "No background music files found. Place .mp3 files in music/ or add assets/background_music.mp3. Skipping music.")
-        return {}
-
-    log("INFO", f"Matching background music for {len(clips)} clips "
-                f"({len(available)} tracks available)...")
-    music_entries = match_music_batch(
-        clips, available,
-        llm_model=args.llm_model,
-        api_key=args.api_key,
-    )
-    matched = sum(1 for c in clips if c.get("rank") in music_entries)
-    log("OK", f"Music matched for {matched}/{len(clips)} clips")
-    return music_entries
-
+def _subtitle_words_fingerprint(words):
+    """Stable hash of a clip's raw subtitle words — used as cache key."""
+    payload = json.dumps(words, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 def _prepare_subtitles(clips, segments, args, detected_language):
-    """Prepare subtitle words for all clips."""
+    """Prepare subtitle words for all clips.
+
+    All clips are translated in ONE batched LLM call (see
+    ``batch_translate_subtitles``) — this replaced the old per-clip serial
+    loop that was the single largest runtime cost on long videos
+    (~25 min for a 9-clip / 18-min video). Per-clip results are cached to
+    individual files (keyed by a fingerprint of the source words) so reruns
+    of the same clip skip the LLM entirely.
+    """
     if not args.subtitles or not segments:
         return
 
-    from .subtitles import get_clip_words
-    
     # Always enable fix_errors - even if English, fix Whisper transcription errors
     log("INFO", "Fixing Whisper transcription errors and translating subtitles to English...")
-    from .llm import translate_subtitle_words
-    
+
+    output_dir = Path(args.output)
+    cache_dir = get_clips_cache_dir(output_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalize target language for subtitle translation
+    target_language = getattr(args, "target_language", "en")
+
+    from .subtitles import get_clip_words
+
+    # 1) Fill from per-clip cache where possible; collect the rest for batching.
+    pending: list[dict] = []
+    cached_map: dict[int, list[dict]] = {}
     for clip in clips:
-        try:
-            raw_words = get_clip_words(
-                segments,
-                clip_start=clip["start"],
-                clip_end=clip["end"],
-            )
-            # Always use fix_errors=True to fix Whisper mistakes
-            clip["_subtitle_words"] = translate_subtitle_words(
-                raw_words,
-                llm_model=args.llm_model,
-                api_key=args.api_key,
-                fix_errors=True,  # Enable Whisper error fixing
-            )
-        except Exception as e:
-            log("WARN", f"Could not translate subtitles for clip #{clip['rank']}: {e}")
-            clip["_subtitle_words"] = []
+        rank = int(clip.get("rank", 0))
+        raw_words = get_clip_words(
+            segments, clip_start=clip["start"], clip_end=clip["end"]
+        )
+        if not raw_words:
+            cached_map[rank] = []
+            continue
+        fingerprint = _subtitle_words_fingerprint(raw_words)
+        cache_file = cache_dir / f"subtitle_words_{fingerprint}.json"
+        cached = _load_cached_subtitle_words(cache_file, fingerprint)
+        if cached is not None:
+            cached_map[rank] = cached
+        else:
+            pending.append(clip)
+
+    # 2) Batch-translate whatever wasn't cached.
+    if pending:
+        from .llm import batch_translate_subtitles
+        translated_map = batch_translate_subtitles(
+            pending, segments,
+            llm_model=args.llm_model,
+            api_key=args.api_key,
+            fix_errors=True,
+            target_language=target_language,
+        )
+        for clip in pending:
+            rank = int(clip.get("rank", 0))
+            words = translated_map.get(rank, [])
+            cached_map[rank] = words
+            # Cache per clip (skip empty results — nothing useful to persist).
+            if words:
+                fingerprint = _subtitle_words_fingerprint(
+                    get_clip_words(segments, clip_start=clip["start"], clip_end=clip["end"])
+                )
+                cache_file = cache_dir / f"subtitle_words_{fingerprint}.json"
+                _save_subtitle_words_cache(cache_file, fingerprint, words, detected_language)
+
+    # 3) Attach to clips.
+    for clip in clips:
+        rank = int(clip.get("rank", 0))
+        clip["_subtitle_words"] = cached_map.get(rank, [])
+
+
+def _load_cached_subtitle_words(cache_path, fingerprint):
+    """Load subtitle words cache when the fingerprint matches the current clip words.
+
+    ``cache_path`` is now a per-clip file (one fingerprint per file), so the
+    match check is exact rather than the previous single-file design that
+    could only ever hold one clip's words.
+    """
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log("WARN", f"Subtitle cache unreadable ({e}), regenerating...")
+        cache_path.unlink(missing_ok=True)
+        return None
+    if not isinstance(data, dict) or data.get("fingerprint") != fingerprint:
+        return None
+    cached_words = data.get("words")
+    if not isinstance(cached_words, list):
+        cache_path.unlink(missing_ok=True)
+        return None
+    return cached_words
+
+
+def _save_subtitle_words_cache(cache_path, fingerprint, words, detected_language):
+    """Persist subtitle words cache right after LLM generation (write-through)."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "fingerprint": fingerprint,
+        "language_info": detected_language or {"language": "unknown", "language_probability": 0.0},
+        "words": words,
+    }
+    cache_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _get_crop_target_from_orientation(orientation: str) -> str:
@@ -152,8 +201,6 @@ def main() -> None:
             "Environment variables:\n"
             "  OPENROUTER_API_KEY   OpenRouter key (default backend, free model)\n"
             "  OPENROUTER_MODEL     Override default model on OpenRouter\n"
-            "  ANTHROPIC_API_KEY    Anthropic Claude key\n"
-            "  OPENAI_API_KEY       OpenAI key\n"
             "  OLLAMA_MODEL         Local Ollama model name (default: llama3.1)\n"
             "\n"
             "Configuration:\n"
@@ -193,6 +240,13 @@ def main() -> None:
                     help=f"Whisper batch size (default: {defaults['batch_size']}; lower if OOM)")
     ap.add_argument("--workers", type=int, default=1,
                     help="(ignored) previously used for parallel ffmpeg workers")
+    ap.add_argument("--llm-parallel", action="store_true",
+                    help="Run LLM chunk calls AND per-clip subtitle translations in parallel "
+                         "(big speedup for long videos on paid/rate-limit-free models; on the "
+                         "free tier OpenRouter may rate-limit concurrent calls)")
+    ap.add_argument("--no-improve", action="store_true",
+                    help="Skip the LLM improve/translate/deduplicate stage (find_clips already "
+                         "emits English fields). Saves several whole-clip LLM calls per run.")
     ap.add_argument("--chunk-duration", type=float, default=defaults["chunk_duration"],
                     help=f"LLM chunk duration in seconds (default: {defaults['chunk_duration']})")
     ap.add_argument("--chunk-overlap", type=float, default=defaults["chunk_overlap"],
@@ -205,12 +259,20 @@ def main() -> None:
                     help="API key (overrides env vars)")
     ap.add_argument("--llm-model", default=None,
                     help="Override LLM model name for OpenRouter")
+    ap.add_argument("--system-prompt", default=None,
+                    help="Override the system prompt used for clip selection "
+                         "(the {min_dur}/{max_dur}/{max_clips}/{min_score} tokens are "
+                         "filled in automatically). Defaults to the built-in educational prompt.")
 
     # ── Post-processing options ──────────────────────────────────────────
     ap.add_argument("--subtitles", action=argparse.BooleanOptionalAction,
                     default=defaults["subtitles_enabled"],
                     help=f"TikTok-style word-by-word subtitles "
                          f"(default: {'on' if defaults['subtitles_enabled'] else 'off'})")
+    ap.add_argument("--target-language", default="en",
+                    help="Language to translate clip titles/captions/subtitles into "
+                         "('en'=English, 'id'=Indonesian, 'auto'=keep original language, "
+                         "or any language label/code for a custom target; default: en)")
     ap.add_argument("--subtitle-position", default=defaults["subtitle_position"],
                     choices=["center", "upper", "lower"],
                     help=f"Subtitle position (default: {defaults['subtitle_position']})")
@@ -232,16 +294,10 @@ def main() -> None:
     ap.add_argument("--split-screen", action="store_true", default=False,
                     help="Split-screen layout: face close-up on top, gameplay on bottom "
                          "(for landscape→vertical; implies --crop)")
-
-    # ── Background music ─────────────────────────────────────────────────
-    ap.add_argument("--music", action=argparse.BooleanOptionalAction,
-                    default=defaults["music_enabled"],
-                    help=f"Add background music matched to clip mood with a fade-out at the end "
-                         f"(default: {'on' if defaults['music_enabled'] else 'off'})")
-    ap.add_argument("--music-dir", default=defaults["music_dir"],
-                    help=f"Directory containing music files (default: ./{defaults['music_dir']}/)")
-    ap.add_argument("--music-volume", type=float, default=defaults["music_volume"],
-                    help=f"Background music volume 0.0-1.0 (default: {defaults['music_volume']})")
+    ap.add_argument("--no-active-speaker", dest="active_speaker", action="store_false",
+                    default=True,
+                    help="Disable active-speaker following (pan to the speaking person). "
+                         "When set, crop tracks the largest person instead (legacy).")
 
     # ── Encoding quality & speed ─────────────────────────────────────────
     ap.add_argument("--encoding-preset", default=defaults.get("encoding_preset", "veryfast"),
@@ -277,6 +333,10 @@ def main() -> None:
     lang = None if args.lang.lower() == "none" else args.lang
     video = Path(args.video)
 
+    # Allow config.yaml `llm_parallel: true` to enable parallelism without the flag
+    if not args.llm_parallel and defaults.get("llm_parallel"):
+        args.llm_parallel = True
+
     # --split-screen implies --crop (needs person detection)
     if args.split_screen:
         args.crop = True
@@ -293,9 +353,9 @@ def main() -> None:
             log("ERROR", f"Clips file not found: {clips_file}")
             sys.exit(1)
 
-        all_clips = json.loads(clips_file.read_text())
+        all_clips = json.loads(clips_file.read_text(encoding="utf-8"))
         if _ensure_filenames(all_clips):
-            clips_file.write_text(json.dumps(all_clips, indent=2, ensure_ascii=False))
+            clips_file.write_text(json.dumps(all_clips, indent=2, ensure_ascii=False), encoding="utf-8")
             log("OK", f"Augmented existing clips with filenames → {clips_file}")
         clips = all_clips[:args.example_count]
 
@@ -305,16 +365,21 @@ def main() -> None:
         print(f"  Video     : {video.name}")
         print(f"  Clips     : {len(clips)} example clips (from {clips_file.name})")
 
-        pp_features = []
-        if args.subtitles: pp_features.append("TikTok Subs")
-        if args.title: pp_features.append("Title Overlay")
-        if args.orientation != "auto": pp_features.append(f"Force {args.orientation}")
-        if args.split_screen: pp_features.append("Split-Screen")
-        elif args.crop: pp_features.append(f"Crop({args.crop_target})")
-        if args.music: pp_features.append("Music")
-        if args.remove_silence: pp_features.append("Silence-Rm")
-        if args.cta: pp_features.append("Instagram-CTA")
-        print(f"  Features  : {', '.join(pp_features) or 'Raw clips only'}")
+        pp_preview = []
+        if args.subtitles: pp_preview.append("TikTok Subs")
+        if args.title: pp_preview.append("Title Overlay")
+        if args.orientation != "auto": pp_preview.append(f"Force {args.orientation}")
+        if args.split_screen: pp_preview.append("Split-Screen")
+        elif args.crop: pp_preview.append(f"Crop({args.crop_target})")
+        if args.remove_silence: pp_preview.append("Silence-Rm")
+        if args.cta: pp_preview.append("Instagram-CTA")
+        tl = getattr(args, "target_language", "en")
+        if tl and tl != "en":
+            pp_preview.append(f"Translate→{tl}")
+        else:
+            pp_preview.append("Translate→English")
+        pp_preview.append(f"Lang: {args.lang or 'auto'}")
+        print(f"  Features  : {', '.join(pp_preview) or 'Raw clips only'}")
         print()
 
         # Summary table
@@ -345,7 +410,7 @@ def main() -> None:
         detected_language = {"language": "unknown", "language_probability": 0.0}
         if cache_path.exists():
             log("INFO", f"Loading cached transcript from {cache_path}")
-            cache_data = json.loads(cache_path.read_text())
+            cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
             if isinstance(cache_data, dict) and "segments" in cache_data:
                 segments = cache_data["segments"]
                 detected_language = cache_data.get("language_info", detected_language)
@@ -367,13 +432,10 @@ def main() -> None:
         # Prepare subtitles
         _prepare_subtitles(clips, segments, args, detected_language)
 
-        # Prepare music
-        music_entries = _prepare_music(clips, args)
-
         # Post-process
         _cta_cfg = {**_cta_defaults, "enabled": args.cta}
         log("DEBUG", f"Example mode postprocess: orientation={args.orientation}, crop={args.crop}")
-        any_postprocess = args.subtitles or args.title or args.orientation != "auto" or args.crop or args.music or args.remove_silence or args.cta
+        any_postprocess = args.subtitles or args.title or args.orientation != "auto" or args.crop or args.remove_silence or args.cta
         if any_postprocess and raw_outputs:
             outputs = postprocess_clips(
                 raw_outputs,
@@ -387,9 +449,7 @@ def main() -> None:
                 enable_crop=args.crop,
                 crop_target=args.crop_target,
                 enable_split_screen=args.split_screen,
-                enable_music=args.music,
-                music_entries=music_entries,
-                music_volume=args.music_volume,
+                enable_active_speaker=args.active_speaker,
                 enable_silence_removal=args.remove_silence,
                 max_silence=args.max_silence,
                 cta_config=_cta_cfg,
@@ -426,14 +486,18 @@ def main() -> None:
     print(f"  Duration  : {args.min}–{args.max}s per clip")
     print(f"  Max clips : {args.max_clips} (LLM decides actual count)")
     # Show post-processing features
-    pp_features = []
-    if args.subtitles: pp_features.append("TikTok Subs")
-    if args.title: pp_features.append("Title Overlay")
-    if args.orientation != "auto": pp_features.append(f"Force {args.orientation}")
-    if args.crop: pp_features.append(f"Crop({args.crop_target})")
-    if args.music: pp_features.append("Music")
-    if args.remove_silence: pp_features.append("Silence-Rm")
-    print(f"  Features  : {', '.join(pp_features) or 'Raw clips only'}")
+    pp_preview = []
+    if args.subtitles: pp_preview.append("TikTok Subs")
+    if args.title: pp_preview.append("Title Overlay")
+    if args.orientation != "auto": pp_preview.append(f"Force {args.orientation}")
+    if args.crop: pp_preview.append(f"Crop({args.crop_target})")
+    if args.remove_silence: pp_preview.append("Silence-Rm")
+    tl = getattr(args, "target_language", "en")
+    if tl and tl != "en":
+        pp_preview.append(f"Translate→{tl}")
+    else:
+        pp_preview.append("Translate→English")
+    print(f"  Features  : {', '.join(pp_preview) or 'Raw clips only'}")
     print()
 
     # ── 1. Transcribe ────────────────────────────────────────────────────────
@@ -443,7 +507,7 @@ def main() -> None:
     detected_language = {"language": "unknown", "language_probability": 0.0}
     if cache_path.exists():
         log("INFO", f"Loading cached transcript from {cache_path}")
-        cache_data = json.loads(cache_path.read_text())
+        cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
         if isinstance(cache_data, dict) and "segments" in cache_data:
             segments = cache_data["segments"]
             detected_language = cache_data.get("language_info", detected_language)
@@ -464,13 +528,13 @@ def main() -> None:
         )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_data = {"segments": segments, "language_info": detected_language}
-        cache_path.write_text(json.dumps(cache_data, indent=2, ensure_ascii=False))
+        cache_path.write_text(json.dumps(cache_data, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"Transcript cached → {cache_path}")
 
     if args.save_transcript:
         output_dir.mkdir(parents=True, exist_ok=True)
         tx = output_dir / "transcript.json"
-        tx.write_text(json.dumps(segments, indent=2, ensure_ascii=False))
+        tx.write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"Transcript → {tx}")
 
     # ── 2. Pre-filter ────────────────────────────────────────────────────────
@@ -496,12 +560,25 @@ def main() -> None:
     clips_cache_file = output_dir / "clips.json"
     raw_clips_cache_file = output_dir / ".clips_raw.json"
     clips_from_cache = False
+    clips = None
 
     if clips_cache_file.exists():
+        text = clips_cache_file.read_text(encoding="utf-8")
+        if not text.strip():
+            log("WARN", f"Cache file {clips_cache_file} is empty — ignoring and regenerating")
+            clips_cache_file = None  # force regeneration below
+            clips = None
+        else:
+            try:
+                clips = json.loads(text)
+            except json.JSONDecodeError as e:
+                log("WARN", f"Cache file {clips_cache_file} is corrupt ({e}) — ignoring and regenerating")
+                clips_cache_file = None
+                clips = None
+    if clips is not None:
         log("INFO", f"Loading cached clips from {clips_cache_file}")
-        clips = json.loads(clips_cache_file.read_text())
         if _ensure_filenames(clips):
-            clips_cache_file.write_text(json.dumps(clips, indent=2, ensure_ascii=False))
+            clips_cache_file.write_text(json.dumps(clips, indent=2, ensure_ascii=False), encoding="utf-8")
             log("OK", f"Patched filenames in cache → {clips_cache_file}")
         log("OK", f"Loaded {len(clips)} clips from cache (skipped LLM, tighten, improve)")
         clips_from_cache = True
@@ -520,6 +597,8 @@ def main() -> None:
             chunk_overlap=args.chunk_overlap,
             raw_clips_cache_file=raw_clips_cache_file,
             energy_events=energy_events,
+            llm_parallel=args.llm_parallel,
+            system_prompt=args.system_prompt,
         )
         _ensure_filenames(clips)
 
@@ -545,15 +624,22 @@ def main() -> None:
             log("OK", "Clip boundaries optimized for viral hooks and natural endings")
 
         # ── 3b. Improve and fix clips ──────────────────────────────────────
-        log("INFO", "Improving clips: translate to English, fix captions, deduplicate topics...")
-        clips = fix_and_improve_clips(
-            clips,
-            llm_model=args.llm_model,
-            api_key=args.api_key,
-            detected_language=detected_language,
-        )
-        _ensure_filenames(clips)
-        log("OK", f"Clip improvement complete: {len(clips)} clips after deduplication")
+        if args.no_improve:
+            log("INFO", "Skipping improve/translate/deduplicate stage (--no-improve). "
+                        "find_clips already emits English fields; reruns reuse cached clips.json")
+        else:
+            tl = getattr(args, "target_language", "en")
+            log("INFO", f"Improving clips: translate to {tl or 'English'}, fix captions, "
+                        f"deduplicate topics...")
+            clips = fix_and_improve_clips(
+                clips,
+                llm_model=args.llm_model,
+                api_key=args.api_key,
+                detected_language=detected_language,
+                target_language=tl,
+            )
+            _ensure_filenames(clips)
+            log("OK", f"Clip improvement complete: {len(clips)} clips after deduplication")
 
     # Save metadata early
     meta = save_clips_to_disk(clips, output_dir)
@@ -595,12 +681,29 @@ def main() -> None:
     # ── 5. Prepare subtitles ─────────────────────────────────────────────────
     _prepare_subtitles(clips, segments, args, detected_language)
 
-    # ── 5b. Prepare background music ─────────────────────────────────────────
-    music_entries = _prepare_music(clips, args)
-
     # ── 6. Post-process ──────────────────────────────────────────────────────
     _cta_cfg = {**_cta_defaults, "enabled": args.cta}
-    any_postprocess = args.subtitles or args.title or args.orientation != "auto" or args.crop or args.music or args.remove_silence or args.cta
+    any_postprocess = args.subtitles or args.title or args.orientation != "auto" or args.crop or args.remove_silence or args.cta
+
+    # Human-readable summary of what post-processing actually ran. This list was
+    # previously only built in the --example branch, so the normal path raised
+    # NameError on the final summary line *after* a fully successful render.
+    pp_features: list[str] = []
+    if args.subtitles:
+        pp_features.append("subtitles")
+    if args.title:
+        pp_features.append("title-overlay")
+    if args.orientation != "auto":
+        pp_features.append(f"orientation({args.orientation})")
+    if args.split_screen:
+        pp_features.append("split-screen")
+    elif args.crop:
+        pp_features.append(f"crop({_get_crop_target_from_orientation(args.orientation)})")
+    if args.remove_silence:
+        pp_features.append("silence-removal")
+    if args.cta:
+        pp_features.append("instagram-cta")
+
     if any_postprocess and raw_outputs:
         crop_target = _get_crop_target_from_orientation(args.orientation)
         outputs = postprocess_clips(
@@ -615,9 +718,7 @@ def main() -> None:
             enable_crop=args.crop,
             crop_target=crop_target,
             enable_split_screen=args.split_screen,
-            enable_music=args.music,
-            music_entries=music_entries,
-            music_volume=args.music_volume,
+            enable_active_speaker=args.active_speaker,
             enable_silence_removal=args.remove_silence,
             max_silence=args.max_silence,
             cta_config=_cta_cfg,

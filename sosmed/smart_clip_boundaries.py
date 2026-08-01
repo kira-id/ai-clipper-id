@@ -269,22 +269,40 @@ def _find_best_ending(
     words: list[dict[str, Any]],
     proposed_end: float,
     lookback_window: float = 6.0,
+    lookahead_window: float = 5.0,
     min_duration: float = 5.0,
+    max_end: float | None = None,
 ) -> float:
     """
     Find the BEST ending point for viral retention.
 
+    Searches BOTH directions around ``proposed_end``:
+      - backward, to trim a trailing half-sentence, and
+      - forward, to *finish* a thought the LLM cut off mid-sentence.
+
+    Only searching backward (the previous behaviour) meant a clip whose
+    proposed end landed in the middle of a sentence could never be extended to
+    complete it, so clips routinely ended abruptly on a conjunction.
+
     Strategy:
-    1. Find all sentence boundaries in the lookback window
-    2. Score each boundary for ending quality
-    3. Pick the highest-scoring boundary that maintains min duration
-    4. Prefer boundaries closer to proposed_end with good scores
+    1. Collect candidate sentence boundaries in the whole window.
+    2. Score each for ending quality.
+    3. Penalise distance from proposed_end, asymmetrically — extending a little
+       to complete a sentence is much cheaper than truncating content away.
+    4. Pick the highest scorer that respects min_duration / max_end.
     """
     if not words:
         return proposed_end
 
-    end_window_start = max(0, proposed_end - lookback_window)
-    words_in_window = [w for w in words if w["start"] >= end_window_start and w["end"] <= proposed_end + 0.5]
+    window_start = max(0.0, proposed_end - lookback_window)
+    window_end = proposed_end + lookahead_window
+    if max_end is not None:
+        window_end = min(window_end, max_end)
+
+    words_in_window = [
+        w for w in words
+        if w["end"] >= window_start and w["end"] <= window_end
+    ]
 
     if not words_in_window:
         return proposed_end
@@ -292,37 +310,45 @@ def _find_best_ending(
     boundaries = _find_sentence_boundaries(words_in_window, min_gap=0.6)
 
     first_word = words[0] if words else None
-    min_end_time = (first_word["start"] if first_word else 0) + min_duration
+    min_end_time = (first_word["start"] if first_word else 0.0) + min_duration
 
     if not boundaries:
-        # No clear boundaries - find last non-weak word
+        # No clear boundary anywhere: back off to the last non-weak word.
         for i in range(len(words_in_window) - 1, -1, -1):
+            if words_in_window[i]["end"] > proposed_end:
+                continue
             word_text = words_in_window[i]["word"].lower().strip(".,!?;:")
             if word_text not in BAD_ENDING_WORDS:
-                return min(proposed_end, words_in_window[i]["end"] + 0.2)
+                return words_in_window[i]["end"] + 0.25
         return min(proposed_end, words_in_window[-1]["end"] + 0.3)
 
-    # Score all valid boundaries
-    scored_boundaries = []
+    scored_boundaries: list[tuple[float, float, int]] = []
     for idx in boundaries:
         boundary_time = words_in_window[idx]["end"]
-        if boundary_time >= min_end_time:
-            score = _score_ending_quality(words_in_window, idx)
-            # Slight penalty for being too far from proposed_end
-            distance_penalty = (proposed_end - boundary_time) * 2
-            adjusted_score = score - distance_penalty
-            scored_boundaries.append((adjusted_score, boundary_time, idx))
+        if boundary_time < min_end_time:
+            continue
+        if max_end is not None and boundary_time > max_end:
+            continue
+
+        score = float(_score_ending_quality(words_in_window, idx))
+
+        delta = boundary_time - proposed_end
+        if delta >= 0:
+            # Extending forward to complete a thought — cheap.
+            score -= delta * 1.5
+        else:
+            # Truncating backward throws content away — expensive.
+            score -= (-delta) * 4.0
+
+        scored_boundaries.append((score, boundary_time, idx))
 
     if not scored_boundaries:
-        # Fallback to last boundary
         return min(proposed_end, words_in_window[boundaries[-1]]["end"] + 0.2)
 
-    # Pick highest scored boundary
     scored_boundaries.sort(key=lambda x: -x[0])
     best_boundary_idx = scored_boundaries[0][2]
 
-    boundary_word = words_in_window[best_boundary_idx]
-    return boundary_word["end"] + 0.2
+    return words_in_window[best_boundary_idx]["end"] + 0.25
 
 
 def _validate_and_fix_hook_closing(
@@ -360,10 +386,12 @@ def _validate_and_fix_hook_closing(
     # Validate closing_line
     closing = clip.get("closing_line", "").strip()
     if closing:
-        closing_search_start = max(clip_end - 8.0, clip_start)
+        # Search a window that extends slightly PAST the proposed end too — the
+        # LLM often quotes a closing line that finishes just after its own cut,
+        # and clamping with min() would silently discard the real ending.
         closing_words = _find_text_in_transcript(
             segments, closing,
-            search_range=(closing_search_start, clip_end)
+            search_range=(max(clip_end - 8.0, clip_start), clip_end + 5.0)
         )
 
         if closing_words:
@@ -372,7 +400,7 @@ def _validate_and_fix_hook_closing(
                 clip["_closing_original"] = closing
                 clip["closing_line"] = actual_closing
                 clip["_closing_end_adjusted"] = clip["end"]
-                clip["end"] = min(clip_end, closing_words[-1]["end"] + 0.2)
+                clip["end"] = closing_words[-1]["end"] + 0.25
 
     return clip
 
@@ -416,46 +444,51 @@ def smart_adjust_clip_boundaries(
         if validate_hook_closing:
             clip = _validate_and_fix_hook_closing(clip, segments)
 
-        # Step 2: Get words in the clip range
+        # Step 2: Get words around the clip range. The tolerance must cover the
+        # ending search's lookahead window, otherwise there are no candidate
+        # words past clip["end"] and the ending can only ever be truncated.
         words = _find_words_in_range(
             segments,
             clip["start"],
             clip["end"],
-            tolerance=0.5,
+            tolerance=6.0,
         )
 
         if not words:
             continue
 
-        # Step 3: Find optimal hook position
-        new_start = _find_strong_hook_position(words, clip["start"], lookforward_window=4.0)
+        orig_start = clip["start"]
+        orig_end = clip["end"]
 
-        # Step 4: Find optimal ending position
+        # Step 3: Find optimal hook position
+        new_start = _find_strong_hook_position(words, orig_start, lookforward_window=4.0)
+
+        # Step 4: Find optimal ending position (may extend past orig_end to
+        # complete a sentence, bounded by max_duration).
         new_end = _find_best_ending(
             words,
-            clip["end"],
+            orig_end,
             lookback_window=6.0,
+            lookahead_window=5.0,
             min_duration=min_duration,
+            max_end=new_start + max_duration,
         )
 
         # Step 5: Apply constraints
         if new_end - new_start < min_duration:
-            if clip["end"] - new_start >= min_duration:
-                new_end = clip["end"]
-            elif new_end - clip["start"] >= min_duration:
-                new_start = clip["start"]
+            if orig_end - new_start >= min_duration:
+                new_end = orig_end
+            elif new_end - orig_start >= min_duration:
+                new_start = orig_start
             else:
                 continue
 
         if new_end - new_start > max_duration:
             new_end = new_start + max_duration
 
-        # Apply adjustments if they improve the clip
-        original_dur = clip["end"] - clip["start"]
-        new_dur = new_end - new_start
-
-        # Apply if: start moved to skip filler, or end improved for sentence boundary
-        if new_start > clip["start"] + 0.2 or abs(new_end - clip["end"]) > 0.4:
+        # Apply if the start skipped filler, or the end moved to a real
+        # sentence boundary (in either direction).
+        if new_start > orig_start + 0.2 or abs(new_end - orig_end) > 0.4:
             clip["start"] = new_start
             clip["end"] = new_end
 

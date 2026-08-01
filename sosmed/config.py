@@ -12,64 +12,6 @@ from .utils import log
 
 # Default config values (used if config.yaml doesn't exist)
 DEFAULT_CONFIG: dict[str, Any] = {
-    "music_library": [
-        {
-            "id": "upbeat_pop",
-            "category": "upbeat",
-            "mood": "energetic, happy, motivational, fun",
-            "description": "Upbeat pop/electronic beat — great for tips, tutorials, success stories",
-            "file": "upbeat_pop.mp3",
-        },
-        {
-            "id": "chill_lofi",
-            "category": "chill",
-            "mood": "relaxed, calm, thoughtful, cozy",
-            "description": "Lo-fi hip hop chill beat — perfect for storytelling, explanations, reflections",
-            "file": "chill_lofi.mp3",
-        },
-        {
-            "id": "dramatic_cinematic",
-            "category": "dramatic",
-            "mood": "intense, serious, suspenseful, emotional",
-            "description": "Cinematic orchestral — for shocking reveals, serious topics, emotional moments",
-            "file": "dramatic_cinematic.mp3",
-        },
-        {
-            "id": "inspiring_ambient",
-            "category": "inspiring",
-            "mood": "hopeful, uplifting, inspirational, warm",
-            "description": "Ambient inspirational — for motivational content, success stories, advice",
-            "file": "inspiring_ambient.mp3",
-        },
-        {
-            "id": "tech_electronic",
-            "category": "tech",
-            "mood": "futuristic, modern, innovative, fast",
-            "description": "Electronic/tech beat — for tech topics, innovation, how-tos, demonstrations",
-            "file": "tech_electronic.mp3",
-        },
-        {
-            "id": "funny_quirky",
-            "category": "funny",
-            "mood": "comedic, playful, silly, lighthearted",
-            "description": "Quirky comedic — for funny moments, memes, roasts, lighthearted content",
-            "file": "funny_quirky.mp3",
-        },
-        {
-            "id": "sad_piano",
-            "category": "emotional",
-            "mood": "sad, melancholic, touching, sentimental",
-            "description": "Soft piano — for emotional stories, heartfelt moments, personal sharing",
-            "file": "sad_piano.mp3",
-        },
-        {
-            "id": "hype_trap",
-            "category": "hype",
-            "mood": "aggressive, confident, bold, powerful",
-            "description": "Trap/bass beat — for bold claims, confrontational takes, confidence, hype",
-            "file": "hype_trap.mp3",
-        },
-    ],
     "defaults": {
         "whisper_model": "turbo",
         "language": "en",
@@ -85,13 +27,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "vad_speech_pad_ms": 200,
         "chunk_duration": 360.0,
         "chunk_overlap": 60.0,
+        "llm_parallel": False,  # run LLM chunk + per-clip subtitle calls concurrently
         "output_dir": "clips",
         "subtitles_enabled": True,
         "subtitle_position": "lower",
         "subtitle_margin_pct": 25.0,  # 25% from bottom for "lower" position
-        "music_enabled": False,
-        "music_dir": "music",
-        "music_volume": 0.20,
         "silence_removal_enabled": True,
         "max_silence_duration": 1.5,
         "encoding_preset": "veryfast",  # ffmpeg x264 preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow
@@ -110,7 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fade_duration": 0.5,
     },
     "openrouter": {
-        "model": "arcee-ai/trinity-large-preview:free",
+        "model": "openrouter/free",
         "base_url": "https://openrouter.ai/api/v1",
     },
 }
@@ -182,12 +122,6 @@ def _merge_configs(defaults: dict, user: dict) -> dict:
             result[key] = value
 
     return result
-
-
-def get_music_library() -> list[dict[str, str]]:
-    """Get the configured music library."""
-    config = load_config()
-    return config.get("music_library", DEFAULT_CONFIG["music_library"])
 
 
 def get_defaults() -> dict[str, Any]:

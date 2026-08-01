@@ -158,6 +158,7 @@ def _detect_spikes(
     window_sec: float = 0.5,
     local_radius: int = 20,
     spike_threshold: float = 2.0,
+    out_of_speech_threshold: float = 3.0,
     high_energy_percentile: float = 80.0,
     speech_regions: list[tuple[float, float]] | None = None,
 ) -> list[dict[str, Any]]:
@@ -167,14 +168,22 @@ def _detect_spikes(
     All detection is **relative** (ratio to local median), so recording
     volume / mic gain does not matter.
 
+    Detection is no longer hard-gated to speech regions: a sudden loud spike
+    outside any transcript segment is kept (with a stricter ratio) because it
+    can be a scream/reaction Whisper failed to transcribe. Sustained loudness
+    outside speech (typically music/BGM) is dropped, preserving the original
+    goal of not treating background music as an emotional peak.
+
     Args:
         rms_values: Per-window RMS energy.
         window_sec: Duration of each window in seconds.
         local_radius: Number of windows on each side for local baseline.
-        spike_threshold: Multiplier above local median to count as spike.
+        spike_threshold: Multiplier above local median to count as an in-speech spike.
+        out_of_speech_threshold: Stricter multiplier for spikes OUTSIDE speech
+            (guards against flagging musical drops as emotional moments).
         high_energy_percentile: Percentile above which energy is "high".
 
-    Returns list of {"time": float, "rms": float, "kind": str}.
+    Returns list of {"time": float, "rms": float, "kind": str, "in_speech": bool}.
     """
     n = len(rms_values)
     if n < 3:
@@ -206,8 +215,6 @@ def _detect_spikes(
 
     for i, rms in enumerate(rms_values):
         t = i * window_sec
-        if not _is_in_speech_region(t):
-            continue
 
         # Skip near-silent windows — no emotion here
         if rms < _SILENCE_FLOOR:
@@ -221,12 +228,23 @@ def _detect_spikes(
         # Floor: don't let baseline drop below half the global median
         local_median = max(local_median, global_median * 0.5)
 
+        in_speech = _is_in_speech_region(t)
+        # Out-of-speech spikes require a stricter jump (music/BGM guard).
+        effective_threshold = spike_threshold if in_speech else out_of_speech_threshold
+
         # Spike: sudden jump above local baseline
-        if rms > local_median * spike_threshold:
-            events.append({"time": round(t, 2), "rms": round(rms, 1), "kind": "spike"})
-        # Sustained high energy (top percentile AND meaningfully above median)
-        elif rms >= high_threshold and rms > global_median * 1.5:
-            events.append({"time": round(t, 2), "rms": round(rms, 1), "kind": "high"})
+        if rms > local_median * effective_threshold:
+            events.append({
+                "time": round(t, 2), "rms": round(rms, 1),
+                "kind": "spike", "in_speech": in_speech,
+            })
+        # Sustained high energy is only meaningful *within* speech — outside it
+        # sustained loudness is almost always music, not an emotional reaction.
+        elif in_speech and rms >= high_threshold and rms > global_median * 1.5:
+            events.append({
+                "time": round(t, 2), "rms": round(rms, 1),
+                "kind": "high", "in_speech": True,
+            })
 
     return events
 
@@ -239,7 +257,12 @@ def _cluster_events(
     """
     Merge nearby events into clusters with start/end times and peak info.
 
-    Returns list of {"start": float, "end": float, "peak_rms": float, "kind": str}.
+    Returns list of {"start": float, "end": float, "peak_rms": float,
+    "kind": str, "in_speech": bool}.
+    - kind "spike": sudden loud jump (scream/reaction), possibly out of speech.
+    - kind "high": sustained high energy within speech (excitement/action).
+    - in_speech is False when the cluster contains any window that was a
+      sudden spike outside any transcript segment (a reaction Whisper missed).
     """
     if not events:
         return []
@@ -252,6 +275,7 @@ def _cluster_events(
         "end": round(events[0]["time"] + window_sec, 2),
         "peak_rms": events[0]["rms"],
         "has_spike": events[0]["kind"] == "spike",
+        "all_in_speech": events[0].get("in_speech", True),
     }
 
     for ev in events[1:]:
@@ -260,6 +284,8 @@ def _cluster_events(
             cur["peak_rms"] = max(cur["peak_rms"], ev["rms"])
             if ev["kind"] == "spike":
                 cur["has_spike"] = True
+            if not ev.get("in_speech", True):
+                cur["all_in_speech"] = False
         else:
             clusters.append(cur)
             cur = {
@@ -267,12 +293,14 @@ def _cluster_events(
                 "end": round(ev["time"] + window_sec, 2),
                 "peak_rms": ev["rms"],
                 "has_spike": ev["kind"] == "spike",
+                "all_in_speech": ev.get("in_speech", True),
             }
     clusters.append(cur)
 
     # Label clusters
     for c in clusters:
         c["kind"] = "spike" if c["has_spike"] else "high"
+        c["in_speech"] = c.pop("all_in_speech")
         del c["has_spike"]
 
     return clusters
@@ -287,15 +315,19 @@ def analyze_audio_energy(
     """
     Analyze audio energy in a video and return clustered high-energy moments.
 
-    Returns list of {"start": float, "end": float, "peak_rms": float, "kind": str}
-    where kind is "spike" (sudden loudness jump — likely scream/reaction) or
-    "high" (sustained high energy — likely excitement/action).
+    Returns list of {"start": float, "end": float, "peak_rms": float,
+    "kind": str, "in_speech": bool} where:
+    - kind "spike": sudden loudness jump (scream/reaction)
+    - kind "high": sustained high energy within speech (excitement/action)
+    - in_speech False means a sudden spike occurred OUTSIDE any transcript
+      segment — a genuine non-verbal reaction Whisper likely missed.
 
     Detection is volume-independent: uses ratio-to-local-median, so a quiet
     streamer who suddenly screams is detected the same as a loud one.
 
-    Energy moments are only emitted inside transcript speech regions. This
-    keeps background music from being treated as emotional peaks.
+    Clusters emitted outside speech require a stricter ratio (3x vs 2x), so
+    sustained background music is still not treated as an emotional peak —
+    but a sudden scream with no words will now be caught instead of dropped.
     """
     log("INFO", "Analyzing audio energy for emotional moments...")
 
@@ -322,7 +354,10 @@ def analyze_audio_energy(
     log("DEBUG", f"Computed RMS for {len(rms_values)} windows "
                  f"({len(rms_values) * window_sec:.0f}s audio)")
 
-    events = _detect_spikes(rms_values, window_sec, speech_regions=speech_regions)
+    events = _detect_spikes(
+        rms_values, window_sec, speech_regions=speech_regions,
+        out_of_speech_threshold=3.0,
+    )
     clusters = _cluster_events(events, window_sec)
 
     if clusters:

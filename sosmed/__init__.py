@@ -8,7 +8,6 @@ Features:
 - Hook-first clip selection with strong openings and closings
 - Word-by-word subtitle highlighting (not karaoke sweep)
 - YOLO person detection with close-up cropping (horizontal→vertical)
-- Background music matching via LLM
 - Silent gap removal for better pacing
 - Non-speech event preservation (laughter, applause, etc.)
 

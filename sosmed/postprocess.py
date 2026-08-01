@@ -1,5 +1,5 @@
 """
-Post-processing orchestrator: subtitles, person detection, music, silence removal.
+Post-processing orchestrator: subtitles, person detection, silence removal.
 
 Takes raw extracted clips and applies visual/audio enhancements
 in a single FFmpeg pass for efficiency.
@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 from .config import get_defaults
-from .music import build_music_filter, choose_music_start_offset
 from .subtitles import generate_ass_subtitles, generate_title_overlay
 from .utils import get_ffmpeg, get_ffprobe, log
 
@@ -171,9 +170,7 @@ def _postprocess_one(
     enable_crop: bool = False,
     crop_target: str = "vertical",
     enable_split_screen: bool = False,
-    enable_music: bool = False,
-    music_entry: dict[str, str] | None = None,
-    music_volume: float = 0.08,
+    enable_active_speaker: bool = True,
     enable_silence_removal: bool = False,
     max_silence: float = 1.5,
     cta_config: dict[str, Any] | None = None,
@@ -188,8 +185,7 @@ def _postprocess_one(
     2. Silence removal (if enabled)
     3. Subtitles overlay
     4. Title overlay (if enabled)
-    5. Background music mixing (if enabled)
-    6. Audio loudnorm
+    5. Audio loudnorm
 
     Returns the path to the post-processed clip.
     """
@@ -280,15 +276,29 @@ def _postprocess_one(
                 log("DEBUG", f"Clip #{clip.get('rank')}: using split-screen layout (face + gameplay)")
             else:
                 # Use dynamic crop regions with interpolation between detections
-                from .person_detection import compute_dynamic_crop_regions, build_dynamic_crop_filter
+                from .person_detection import build_dynamic_crop_filter
 
-                # Compute per-segment crop regions with smooth interpolation
-                crop_regions = compute_dynamic_crop_regions(
-                    detections, src_w, src_h,
-                    target_aspect=target_aspect,
-                    segment_duration=1.0,  # 1-second segments for smooth tracking
-                    smoothing_window=5,
-                )
+                if enable_active_speaker:
+                    # Follow the PERSON WHO IS SPEAKING, not the largest person.
+                    # Required for podcasts (2+ speakers on a single mono track):
+                    # re-identify each person and pan to the active speaker.
+                    from .active_speaker import compute_active_speaker_crop_regions
+                    crop_regions = compute_active_speaker_crop_regions(
+                        raw_clip_path, detections, src_w, src_h,
+                        target_aspect=target_aspect,
+                        segment_duration=1.0,  # 1-second segments for smooth tracking
+                        smoothing_window=5,
+                        fps=max(1.0, info.get("fps", 30.0) or 30.0),
+                    )
+                else:
+                    # Largest-person tracking (legacy behaviour, no audio analysis)
+                    from .person_detection import compute_dynamic_crop_regions
+                    crop_regions = compute_dynamic_crop_regions(
+                        detections, src_w, src_h,
+                        target_aspect=target_aspect,
+                        segment_duration=1.0,
+                        smoothing_window=5,
+                    )
 
                 if not crop_regions:
                     raise RuntimeError(
@@ -370,25 +380,6 @@ def _postprocess_one(
     # ── 4. Build complete FFmpeg command ─────────────────────────────────────
     cmd: list[str] = [get_ffmpeg(), "-y", "-hide_banner"]
     cmd.extend(["-i", raw_clip_path])
-
-    # Extra inputs (music)
-    music_input_idx = None
-    music_start_offset = 0.0
-    if enable_music and music_entry and Path(music_entry.get("file", "")).exists():
-        music_file = music_entry["file"]
-        music_seed = "|".join([
-            str(clip.get("rank", "")),
-            str(clip.get("title", "")),
-            str(clip.get("topic", "")),
-            str(clip.get("start", "")),
-            str(clip.get("end", "")),
-            str(music_entry.get("id", "")),
-        ])
-        music_start_offset = choose_music_start_offset(music_file, clip_duration, seed_source=music_seed)
-        if music_start_offset > 0:
-            log("DEBUG", f"Clip #{clip.get('rank')}: music start offset {music_start_offset:.2f}s ({Path(music_file).name})")
-        cmd.extend(["-stream_loop", "-1", "-i", music_file])
-        music_input_idx = 1  # second input
 
     # Build filter_complex
     filter_parts: list[str] = []
@@ -492,19 +483,7 @@ def _postprocess_one(
 
     if has_audio and afilters:
         afilter_str = ",".join(afilters)
-        if music_input_idx is not None:
-            # Mix with background music
-            filter_parts.append(f"{current_a_label}{afilter_str}[voice]")
-
-            filter_parts.append(build_music_filter(
-                music_input_idx,
-                clip_duration,
-                music_start_offset,
-                music_volume,
-            ))
-            filter_parts.append("[voice][bgm]amix=inputs=2:duration=first:dropout_transition=2:normalize=0[aout]")
-        else:
-            filter_parts.append(f"{current_a_label}{afilter_str}[aout]")
+        filter_parts.append(f"{current_a_label}{afilter_str}[aout]")
 
     if filter_parts:
         full_filter = ";".join(filter_parts)
@@ -618,9 +597,7 @@ def postprocess_clips(
     enable_crop: bool = False,
     crop_target: str = "vertical",
     enable_split_screen: bool = False,
-    enable_music: bool = False,
-    music_entries: dict[int, dict[str, str]] | None = None,
-    music_volume: float = 0.08,
+    enable_active_speaker: bool = True,
     enable_silence_removal: bool = False,
     max_silence: float = 1.5,
     cta_config: dict[str, Any] | None = None,
@@ -642,9 +619,6 @@ def postprocess_clips(
         enable_crop: Enable person-detection crop
         crop_target: "vertical", "horizontal", or "square"
         enable_split_screen: Enable split-screen layout (face on top, gameplay on bottom)
-        enable_music: Enable background music
-        music_entries: Dict mapping clip rank → music entry
-        music_volume: Background music volume (0.0–1.0)
         enable_silence_removal: Enable silence gap removal
         max_silence: Max silence gap to allow (seconds)
     """
@@ -665,8 +639,6 @@ def postprocess_clips(
         features.append(f"crop({crop_target})")
     if enable_split_screen:
         features.append("split-screen")
-    if enable_music:
-        features.append("music")
     if enable_silence_removal:
         features.append("silence-removal")
     if cta_config and cta_config.get("enabled"):
@@ -696,7 +668,6 @@ def postprocess_clips(
                 continue
 
             clip = rank_to_clip[rank]
-            music_entry = (music_entries or {}).get(rank)
 
             fut = pool.submit(
                 _postprocess_one,
@@ -708,9 +679,7 @@ def postprocess_clips(
                 enable_crop=enable_crop,
                 crop_target=crop_target,
                 enable_split_screen=enable_split_screen,
-                enable_music=enable_music,
-                music_entry=music_entry,
-                music_volume=music_volume,
+                enable_active_speaker=enable_active_speaker,
                 enable_silence_removal=enable_silence_removal,
                 max_silence=max_silence,
                 cta_config=cta_config,
@@ -720,6 +689,7 @@ def postprocess_clips(
             )
             futures[fut] = clip
 
+        failures: list[str] = []
         for fut in as_completed(futures):
             clip = futures[fut]
             try:
@@ -731,5 +701,18 @@ def postprocess_clips(
                 results.append(out)
             except Exception as exc:
                 log("ERROR", f"  #{clip['rank']:>2} postprocess failed: {exc}")
+                failures.append(f"#{clip.get('rank')}: {exc}")
+
+    # A postprocess failure previously just logged and dropped the clip, so the
+    # caller silently shipped the RAW extracted video — no subtitles, no crop,
+    # no title, and no visible error. Surface it instead.
+    if failures and not results:
+        raise RuntimeError(
+            "Post-processing failed for every clip; no subtitles/crop/title "
+            "were applied. First errors: " + " | ".join(failures[:3])
+        )
+    if failures:
+        log("WARN", f"{len(failures)} of {len(futures)} clips failed post-processing "
+                    f"and were dropped: {' | '.join(failures[:3])}")
 
     return sorted(results)

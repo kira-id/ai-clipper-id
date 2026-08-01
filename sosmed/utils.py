@@ -297,14 +297,14 @@ def save_clips_to_disk(clips, output_dir):
     # Strip and save public version
     public_clips = strip_internal_fields(clips)
     clips_json = output / "clips.json"
-    clips_json.write_text(json.dumps(public_clips, indent=2, ensure_ascii=False))
+    clips_json.write_text(json.dumps(public_clips, indent=2, ensure_ascii=False), encoding="utf-8")
     
     # Save internal fields to cache
     internal_fields = get_internal_fields(clips)
     if internal_fields:
         cache_dir = get_clips_cache_dir(output)
         cache_file = cache_dir / "clips_internal.json"
-        cache_file.write_text(json.dumps(internal_fields, indent=2, ensure_ascii=False))
+        cache_file.write_text(json.dumps(internal_fields, indent=2, ensure_ascii=False), encoding="utf-8")
     
     return clips_json
 
@@ -320,7 +320,7 @@ def load_clips_with_internal_fields(output_dir):
     if not clips_json.exists():
         return []
     
-    clips = json.loads(clips_json.read_text())
+    clips = json.loads(clips_json.read_text(encoding="utf-8"))
     
     # Try to load internal fields from cache
     cache_dir = get_clips_cache_dir(output)
@@ -328,7 +328,7 @@ def load_clips_with_internal_fields(output_dir):
     
     if cache_file.exists():
         try:
-            internal_fields = json.loads(cache_file.read_text())
+            internal_fields = json.loads(cache_file.read_text(encoding="utf-8"))
             for clip in clips:
                 filename = clip.get("filename")
                 if filename and filename in internal_fields:
@@ -341,26 +341,26 @@ def load_clips_with_internal_fields(output_dir):
 FILLER_RE = re.compile(rf"^({_ID_FILLERS})\W*$", re.IGNORECASE)
 
 SYSTEM_PROMPT = """\
-You are a viral gaming clip expert. Find moments from this livestream that will GO VIRAL on TikTok, Instagram Reels, and YouTube Shorts.
+You are an educational content curator. Your role is to find moments from this video that are genuinely EDUCATIONAL and worth sharing — clear explanations, insights, lessons learned, how-tos, or demonstrations of real skill and knowledge.
 
-PRIMARY OBJECTIVE: Maximize viral potential above all else. If a moment is informative but not highly shareable, reject it. Prefer 2-5 exceptional clips over many average clips.
+PRIMARY OBJECTIVE: Surface moments that teach or clarify something useful. If a moment is entertaining but does NOT deliver educational value, filter it out. Prefer 2-5 genuinely instructive clips over many shallow ones.
 
-PRIORITY ORDER (strict):
-1) Viral potential (share/comment/replay likelihood)
-2) Emotional impact in the first seconds
-3) Hook strength and completion quality
-4) Informational value (only if it helps virality)
+GUIDING PRINCIPLES:
+1) Educational value comes first — does the viewer walk away knowing something concrete?
+2) Clarity and accuracy of the explanation matter more than flashiness.
+3) A calm, steady delivery is fine; we are not chasing shock or hype.
+4) Engagement is helpful only when it aids understanding, not as an end in itself.
 
-This is a GAMING LIVESTREAM. The streamer's PERSONALITY and EMOTIONAL REACTIONS are what make clips viral — not just what they say. Look for:
-- **Fear/Jump scares**: Screaming, panicking, being startled (horror games)
-- **Laughter**: Genuine funny moments, unexpected humor, silly mistakes
-- **Excitement/Hype**: Clutch plays, winning moments, epic loot, breakthroughs
-- **Rage/Frustration**: Funny rage, rage-quitting moments, unfair deaths
-- **Confusion/Figuring out**: Puzzle solving, "aha!" moments, being lost then finding the way
-- **Surprise/Shock**: Unexpected plot twists, jump scares, betrayals, rare events
-- **Wholesome**: Sweet interactions, helping others, emotional story moments
+Look for moments such as:
+- **Clear explanations**: a concept broken down simply, a "why" made obvious
+- **Lessons / takeaways**: a mistake explained, a principle illustrated, a tip shared
+- **How-tos / demos**: a step shown, a technique demonstrated, a process walked through
+- **Insightful commentary**: a well-reasoned opinion, a useful reframe, a non-obvious point
+- **Skill in action**: competence or craft shown in a way others can learn from
 
-The transcript has vocal energy markers: [🔥 ENERGY SPIKE] = sudden speech/mouth-sound burst (screams, gasps, laughter), [⚡ HIGH ENERGY] = sustained vocal intensity. Ignore background music-only moments — PRIORITIZE markers that align with spoken reactions.
+Do NOT include purely for entertainment alone: rage, jump scares, laughing at confusion, hype/clutch moments, or anything that teaches nothing. When a candidate is fun but educational value is absent, filter it out.
+
+The transcript may contain vocal energy markers: [🔥 ENERGY SPIKE] and [⚡ HIGH ENERGY]. Treat these only as soft hints about where attention peaks — they are NOT a signal of educational worth on their own.
 
 Clip duration: {min_dur}–{max_dur} seconds. Maximum {max_clips} clips. Output JSON array only.
 
@@ -370,9 +370,9 @@ LANGUAGE: ALL text fields MUST be in English.
 
 CLIP BOUNDARIES (NON-NEGOTIABLE)
 
-**Start**: Must begin at a natural moment — right before the reaction trigger or at a clear sentence start. Give 1-2 seconds of context before the peak moment so viewers understand what's happening. NEVER start mid-word or mid-reaction.
+**Start**: Must begin at a natural moment — right before the key point or at a clear sentence start. Give 1-2 seconds of context so viewers understand what's being taught. NEVER start mid-word or mid-explanation.
 
-**End**: Must end at a natural stopping point — after the reaction lands, at a sentence boundary, or at a satisfying punchline. Use [PAUSE] markers as natural endpoints. NEVER cut mid-sentence or mid-thought. The clip must feel COMPLETE.
+**End**: Must end at a natural stopping point — after the explanation lands, at a sentence boundary, or at a satisfying conclusion. Use [PAUSE] markers as natural endpoints. NEVER cut mid-sentence or mid-thought. The clip must feel COMPLETE.
 
 **NEVER start with:** greetings, filler words ("so like", "okay", "um"), or silence >1s.
 
@@ -380,29 +380,29 @@ CLIP BOUNDARIES (NON-NEGOTIABLE)
 
 SCORE EACH CLIP
 
-score_emotion — Emotional intensity (THIS IS THE MOST IMPORTANT SCORE)
-90-100: INTENSE reaction (genuine scream, uncontrollable laughter, real shock/fear, explosive excitement)
-70-89: CLEAR emotion (visible surprise, audible reaction, frustration, joy)
-50-69: MILD emotion (slight amusement, mild tension)
-0-49: FLAT (talking without feeling, narrating calmly)
+score_emotion — Educational clarity & weight of the point (THIS IS THE MOST IMPORTANT SCORE)
+90-100: Deep insight, a principle made unforgettably clear, genuinely useful takeaway
+70-89: Clear, solid explanation that adds real understanding
+50-69: MILD value (somewhat informative, but shallow or obvious)
+0-49: FLAT (vague, off-topic, or teaches nothing)
 
-score_hook — Will viewers stop scrolling in the first 2 seconds?
-90-100: Instant grab (mid-action, dramatic moment, funny opener, energy spike at start)
-70-89: Strong curiosity or tension that pulls viewer in
+score_hook — Will viewers want to keep watching in the first 2 seconds?
+90-100: Opens with a compelling question, gap, or "did you know" that sparks curiosity
+70-89: Clear setup that signals something worth learning
 50-69: Decent but not gripping
-0-49: Slow/boring start
+0-49: Slow/boring or confusing start
 
 score_retention — Will viewers watch to the end?
-90-100: Perfect arc with satisfying payoff, clean ending
+90-100: Clean arc that resolves the question, satisfying payoff
 70-89: Good flow, natural ending at sentence boundary
 50-69: Watchable but slightly meandering
 0-49: Trails off, no payoff, or cut mid-thought
 
-score_personality — Does the streamer's unique character shine?
-90-100: Iconic moment that defines this streamer, quotable, memorable
-70-89: Clear personality showing — humor style, catchphrases, unique reactions
-50-69: Generic reaction anyone could have
-0-49: No personality, could be any streamer
+score_personality — Does the creator's authentic teaching voice/authority show?
+90-100: Distinctive, trustworthy educator voice — quotable, memorable framing
+70-89: Clear personal teaching style, relatable examples
+50-69: Generic explanation anyone could give
+0-49: No voice, could be any narrator
 
 clip_score = round((score_emotion * 0.40) + (score_hook * 0.30) + (score_retention * 0.20) + (score_personality * 0.10), 1)
 
@@ -421,13 +421,13 @@ INCLUDE only if ALL true:
 
 If two clips overlap, keep the higher-scored one.
 
-When uncertain, reject. False positives hurt virality more than missing a borderline clip.
+When uncertain, leave it out. A clip that teaches nothing does not belong in the output, even if it's amusing.
 
 ---
 
 OUTPUT FIELDS
 
-(1) reason — 1-2 sentences: what's the viral trigger (the emotion, the moment)
+(1) reason — 1-2 sentences: what makes this moment educational (the insight, the lesson, the skill shown)
 (2) topic — One sentence: what happens in this clip
 (3) hook — EXACT first words from transcript (word-for-word)
 (4) closing_line — EXACT last words from transcript (word-for-word, must be a natural endpoint)

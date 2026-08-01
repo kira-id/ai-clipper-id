@@ -73,6 +73,12 @@ def transcribe(
     - word_timestamps for precise cut boundaries
     - batch_size > 1 uses BatchedInferencePipeline
     """
+    # Normalize language sentinels. faster-whisper rejects "auto"/"none"
+    # as a literal language code; both mean "let the model detect".
+    # Centralizing this here guarantees no caller can pass an invalid code.
+    if language is not None and str(language).strip().lower() in ("auto", "none", ""):
+        language = None
+
     try:
         from faster_whisper import WhisperModel, BatchedInferencePipeline
     except ImportError:

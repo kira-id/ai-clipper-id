@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from .transcription import transcribe
 from .prefilter import prefilter_segments
 from .llm import generate_single_clip_metadata, translate_subtitle_words
+from .llm.fix_clips import _normalize_target_language, _target_label, _translate_to_language
 from .extraction import extract_clips, _get_video_duration
 from .postprocess import postprocess_clips
 from .config import get_defaults, get_cta_settings
@@ -98,7 +99,7 @@ def _load_cached_subtitle_words(cache_path: Path, fingerprint: str) -> list[dict
         return None
 
     try:
-        data = json.loads(cache_path.read_text())
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
     except Exception as e:
         log("WARN", f"Subtitle cache unreadable ({e}), regenerating...")
         cache_path.unlink(missing_ok=True)
@@ -131,7 +132,7 @@ def _save_subtitle_words_cache(
         "language_info": detected_language or {"language": "unknown", "language_probability": 0.0},
         "words": words,
     }
-    cache_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    cache_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def process_single_video(
@@ -157,11 +158,9 @@ def process_single_video(
     title: str | None = None,
     caption: str | None = None,
     cta: bool | None = None,
-    music: bool = False,
-    music_dir: str = "music",
-    music_volume: float = 0.20,
     encoding_preset: str | None = None,
     encoding_crf: int | None = None,
+    target_language: str | None = None,
 ) -> dict:
     """
     Process a single video and extract the best clip.
@@ -169,6 +168,8 @@ def process_single_video(
     Returns:
         dict with keys: 'topic', 'title', 'video_path', 'start', 'end', 'clip' (full clip dict)
     """
+    # Normalize the target language option (None -> English default).
+    target = _normalize_target_language(target_language)
     video = Path(video_path)
     if not video.exists():
         log("ERROR", f"File not found: {video}")
@@ -191,7 +192,7 @@ def process_single_video(
     cache_path = _get_transcript_cache_path(str(video))
     if cache_path.exists():
         log("INFO", f"Loading cached transcript from {cache_path}")
-        cache_data = json.loads(cache_path.read_text())
+        cache_data = json.loads(cache_path.read_text(encoding="utf-8"))
         if isinstance(cache_data, dict) and "segments" in cache_data:
             segments = cache_data["segments"]
             detected_language = cache_data.get("language_info", detected_language)
@@ -212,7 +213,7 @@ def process_single_video(
         )
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_data = {"segments": segments, "language_info": detected_language}
-        cache_path.write_text(json.dumps(cache_data, indent=2, ensure_ascii=False))
+        cache_path.write_text(json.dumps(cache_data, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"Transcript cached → {cache_path}")
 
     # ── 2. Pre-filter ────────────────────────────────────────────────────────
@@ -238,7 +239,7 @@ def process_single_video(
     _loaded_from_cache = False
     if _meta_cache_path.exists():
         try:
-            _cached_meta = json.loads(_meta_cache_path.read_text())
+            _cached_meta = json.loads(_meta_cache_path.read_text(encoding="utf-8"))
             if not isinstance(_cached_meta, dict):
                 raise ValueError("cache is not a dict")
             log("INFO", f"Loading cached LLM metadata from {_meta_cache_path}")
@@ -264,8 +265,21 @@ def process_single_video(
         # Cache the generated metadata fields
         _meta_fields = ["title", "topic", "caption", "reason", "hook", "closing_line", "comment_bait"]
         _cached_meta = {k: clips[0][k] for k in _meta_fields if k in clips[0]}
-        _meta_cache_path.write_text(json.dumps(_cached_meta, indent=2, ensure_ascii=False))
+        _meta_cache_path.write_text(json.dumps(_cached_meta, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"LLM metadata cached → {_meta_cache_path}")
+
+    # Translate the single clip's metadata into the target language (if requested).
+    # "auto" keeps the generated language; "en" (default) is already English from
+    # the metadata prompt, so skip the extra LLM call.
+    if target not in ("auto", "en"):
+        label = _target_label(target)
+        log("INFO", f"Translating clip metadata to {label}...")
+        translated = _translate_to_language(
+            [clips[0]], label, llm_model=llm_model, api_key=api_key,
+            detected_language=detected_language,
+        )
+        if translated:
+            clips[0] = translated[0]
 
     # Select best clip (rank 1)
     best_clip = clips[0] if clips else None
@@ -278,7 +292,7 @@ def process_single_video(
     log("OK", f"  Topic: {best_clip.get('topic', 'N/A')}")
     log("OK", f"  Title: {best_clip.get('title', 'N/A')}")
 
-    # ── 3c. Translate subtitle words to English ───────────────────────────
+    # ── 3c. Translate subtitle words to the target language ───────────────
     if subtitles:
         from .subtitles import get_clip_words
         raw_words = get_clip_words(
@@ -293,16 +307,18 @@ def process_single_video(
             best_clip["_subtitle_words"] = cached_words
             log("OK", f"Loaded cached subtitle words ({len(cached_words)} words) from {subtitle_cache_path}")
         else:
-            if _should_translate_to_english(detected_language):
-                log("INFO", "Translating subtitle words to English (with Whisper error fixing)...")
+            if target == "auto":
+                log("INFO", "Fixing subtitle transcription errors (keeping original language)...")
             else:
-                log("INFO", "Whisper language is English (detected or forced); still fixing transcription errors...")
+                label = "English" if target == "en" else _target_label(target)
+                log("INFO", f"Translating subtitle words to {label} (with Whisper error fixing)...")
 
             best_clip["_subtitle_words"] = translate_subtitle_words(
                 raw_words,
                 llm_model=llm_model,
                 api_key=api_key,
                 fix_errors=True,  # Enable Whisper error fixing
+                target_language=target_language,
             )
             _save_subtitle_words_cache(
                 subtitle_cache_path,
@@ -328,28 +344,6 @@ def process_single_video(
         log("ERROR", "Failed to extract clip")
         sys.exit(1)
 
-    # ── 4b. Prepare background music ─────────────────────────────────────
-    music_entries: dict = {}
-    if music:
-        from pathlib import Path as _Path
-        from .music import get_available_music
-        available = get_available_music(music_dir)
-        assets_music = _Path(__file__).parent.parent / "assets" / "background_music.mp3"
-        if assets_music.exists():
-            log("INFO", f"Using background music from assets: {assets_music}")
-            selected = {
-                "id": "background_music",
-                "file": str(assets_music),
-                "description": "Background music",
-                "mood": "neutral",
-            }
-            music_entries = {best_clip.get("rank", 1): selected}
-        elif available:
-            selected = available[0]
-            music_entries = {best_clip.get("rank", 1): selected}
-        else:
-            log("WARN", "No background music files found. Skipping music.")
-
     # ── 5. Post-process with subtitles ──────────────────────────────────
     cta_defaults = get_cta_settings()
     cta_cfg = {**cta_defaults, "enabled": cta if cta is not None else cta_defaults.get("enabled", False)}
@@ -368,7 +362,7 @@ def process_single_video(
             fade_duration=float(cta_cfg.get("fade_duration", 0.5)),
         )
         outputs = [cta_result]
-    elif (subtitles or cta_cfg["enabled"] or music) and raw_outputs:
+    elif (subtitles or cta_cfg["enabled"]) and raw_outputs:
         log("INFO", "Adding subtitles overlay...")
         outputs = postprocess_clips(
             raw_outputs,
@@ -379,9 +373,6 @@ def process_single_video(
             subtitle_position=subtitle_position,
             subtitle_margin_pct=subtitle_margin_pct,
             enable_title=False,
-            enable_music=music,
-            music_entries=music_entries,
-            music_volume=music_volume,
             cta_config=cta_cfg,
             encoding_preset=encoding_preset,
             encoding_crf=encoding_crf,
@@ -405,7 +396,7 @@ def process_single_video(
         # Best clip
         best_clip_public = strip_internal_fields([best_clip])[0]
         best_clip_path = output_path / "best_clip.json"
-        best_clip_path.write_text(json.dumps(best_clip_public, indent=2, ensure_ascii=False))
+        best_clip_path.write_text(json.dumps(best_clip_public, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"Saved best clip → {best_clip_path}")
 
         # Save internal fields to cache
@@ -413,12 +404,12 @@ def process_single_video(
         if internal:
             cache_dir = get_clips_cache_dir(output_path)
             cache_file = cache_dir / "clips_internal.json"
-            cache_file.write_text(json.dumps(internal, indent=2, ensure_ascii=False))
+            cache_file.write_text(json.dumps(internal, indent=2, ensure_ascii=False), encoding="utf-8")
 
         # Save all clips for reference
         all_clips_public = strip_internal_fields(clips)
         all_clips_path = output_path / "all_clips.json"
-        all_clips_path.write_text(json.dumps(all_clips_public, indent=2, ensure_ascii=False))
+        all_clips_path.write_text(json.dumps(all_clips_public, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"Saved all {len(clips)} clips → {all_clips_path}")
 
         best_clip_public["video_path"] = str(outputs[0])
@@ -493,7 +484,7 @@ def process_folder(
     out_root = Path(output_dir)
     out_root.mkdir(parents=True, exist_ok=True)
     combined_path = out_root / "all_clips.json"
-    combined_path.write_text(json.dumps(all_clips, indent=2, ensure_ascii=False))
+    combined_path.write_text(json.dumps(all_clips, indent=2, ensure_ascii=False), encoding="utf-8")
 
     print(f"\n{BOLD}{GREEN}{'═' * 50}")
     print(f"   Batch Complete")
@@ -573,18 +564,15 @@ def main() -> None:
                     default=_cta_defaults.get("enabled", False),
                     help="Append Instagram follow CTA at the end "
                          f"(default: {'on' if _cta_defaults.get('enabled') else 'off'})")
-    ap.add_argument("--music", action=argparse.BooleanOptionalAction,
-                    default=defaults.get("music_enabled", False),
-                    help="Add background music with a fade-out at the end (default: from config or off)")
-    ap.add_argument("--music-dir", default=defaults.get("music_dir", "music"),
-                    help="Directory containing music files (default: music/)")
-    ap.add_argument("--music-volume", type=float, default=defaults.get("music_volume", 0.20),
-                    help="Background music volume 0.0-1.0 (default: 0.20)")
     ap.add_argument("--encoding-preset", default=defaults.get("encoding_preset", "veryfast"),
                     choices=["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"],
                     help="ffmpeg x264 encoding preset (default: from config or veryfast)")
     ap.add_argument("--encoding-crf", type=int, default=defaults.get("encoding_crf", 23),
                     help="ffmpeg x264 CRF quality (18-28, lower=better; default: from config or 23)")
+    ap.add_argument("--target-language", default="en",
+                    help="Language to translate clip titles/captions/subtitles into "
+                         "('en'=English, 'id'=Indonesian, 'auto'=keep original language, "
+                         "or any language label/code for a custom target; default: en)")
 
     args = ap.parse_args()
     lang = None if args.lang.lower() == "none" else args.lang
@@ -609,11 +597,9 @@ def main() -> None:
         subtitle_position=args.subtitle_position,
         subtitle_margin_pct=args.subtitle_margin,
         cta=args.cta,
-        music=args.music,
-        music_dir=args.music_dir,
-        music_volume=args.music_volume,
         encoding_preset=args.encoding_preset,
         encoding_crf=args.encoding_crf,
+        target_language=args.target_language,
     )
 
     input_path = Path(args.video)

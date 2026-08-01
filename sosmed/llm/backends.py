@@ -1,5 +1,5 @@
 """
-LLM backends: OpenRouter, Anthropic, OpenAI, Ollama.
+LLM backends: OpenRouter, Ollama.
 """
 
 import json
@@ -297,6 +297,15 @@ def openrouter(
     The reasoning trace (``message.reasoning``) is logged at DEBUG level but
     is never mixed into the text that gets JSON-parsed, so downstream parsing
     is unaffected regardless of whether reasoning fired.
+
+    When *enable_reasoning* is False we explicitly disable reasoning on the
+    request.  This matters for the ``openrouter/free`` pool and other
+    reasoning-capable models (e.g. Qwen3, DeepSeek-R1) whose provider default
+    is ``reasoning.enabled = true``: if we omit the parameter entirely the
+    model thinks by default and dumps its chain-of-thought into the content
+    field, which then fails JSON parsing.  Sending ``reasoning.enabled=false``
+    forces a direct answer.  If a model rejects that parameter we transparently
+    retry without it.
     """
     try:
         from openai import OpenAI
@@ -333,6 +342,12 @@ def openrouter(
                 # OpenRouter forwards this to the underlying provider.
                 # effort can be "low" | "medium" | "high".
                 kwargs["extra_body"] = {"reasoning": {"effort": "high"}}
+            else:
+                # Explicitly disable reasoning. Several models in the
+                # openrouter/free pool (Qwen3, DeepSeek-R1, …) enable
+                # chain-of-thought by default; sending enabled:false forces a
+                # direct answer instead of dumping reasoning into content.
+                kwargs["extra_body"] = {"reasoning": {"enabled": False}}
 
             resp = client.chat.completions.create(**kwargs)
             message = resp.choices[0].message
@@ -374,8 +389,8 @@ def openrouter(
 
     def _call_openrouter(sys_prompt: str, user_prompt: str) -> str:
         """
-        Try with reasoning first; fall back to a plain call if the model
-        signals it does not support the reasoning parameter.
+        Try with reasoning first; fall back to a plain (reasoning-disabled)
+        call if the model signals it does not support the reasoning parameter.
         """
         if not enable_reasoning:
             return _call_once(sys_prompt, user_prompt, reasoning=False)
@@ -411,68 +426,6 @@ def openrouter(
         log("OK", f"OpenRouter returned {len(clips)} clips")
     else:
         log("WARN", "OpenRouter returned 0 clips — model found nothing to clip in this chunk, or JSON parsing failed. Raw response logged above.")
-    return clips
-
-
-def anthropic(system: str, user: str, api_key: str) -> list[dict[str, Any]]:
-    """Call Anthropic Claude. With retry on JSON parse failure and rate limits."""
-    try:
-        import anthropic
-    except ImportError:
-        log("ERROR", "anthropic SDK not installed.  pip install anthropic")
-        sys.exit(1)
-
-    # FIX: updated from stale snapshot ID "claude-sonnet-4-20250514" to the
-    # current model string "claude-sonnet-4-6".
-    model = "claude-sonnet-4-6"
-    log("LLM", f"Anthropic → {BOLD}{model}{RESET}")
-    
-    def _call_anthropic(sys_prompt: str, user_prompt: str) -> str:
-        """Internal function that makes the actual API call and returns raw response."""
-        def api_call():
-            client = anthropic.Anthropic(api_key=api_key)
-            resp = client.messages.create(
-                model=model,
-                max_tokens=8192,
-                system=sys_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-            return resp.content[0].text
-        
-        return _retry_on_rate_limit(api_call, max_retries=5, initial_wait=2.0)
-    
-    clips = _retry_on_json_failure(_call_anthropic, system, user, max_attempts=2)
-    log("OK", f"Anthropic returned {len(clips)} clips")
-    return clips
-
-
-def openai(system: str, user: str, api_key: str) -> list[dict[str, Any]]:
-    """Call OpenAI GPT-4o. With retry on JSON parse failure and rate limits."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        log("ERROR", "openai SDK not installed.  pip install openai")
-        sys.exit(1)
-
-    log("LLM", f"OpenAI → {BOLD}gpt-4o{RESET}")
-    
-    def _call_openai(sys_prompt: str, user_prompt: str) -> str:
-        """Internal function that makes the actual API call and returns raw response."""
-        def api_call():
-            client = OpenAI(api_key=api_key)
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            return resp.choices[0].message.content or ""
-        
-        return _retry_on_rate_limit(api_call, max_retries=5, initial_wait=2.0)
-    
-    clips = _retry_on_json_failure(_call_openai, system, user, max_attempts=2)
-    log("OK", f"OpenAI returned {len(clips)} clips")
     return clips
 
 
@@ -524,9 +477,7 @@ def call_llm(
 
     Backend priority:
       1. OpenRouter  (OPENROUTER_API_KEY) — default free model
-      2. Anthropic   (ANTHROPIC_API_KEY)
-      3. OpenAI      (OPENAI_API_KEY)
-      4. Ollama      (local, no key needed)
+      2. Ollama      (local, no key needed)
 
     Args:
         enable_reasoning: When True, OpenRouter calls will request
@@ -535,8 +486,6 @@ def call_llm(
             False (default) to skip reasoning (better consistency, lower cost/latency).
     """
     or_key = api_key or os.getenv("OPENROUTER_API_KEY")
-    ant_key = os.getenv("ANTHROPIC_API_KEY")
-    oai_key = os.getenv("OPENAI_API_KEY")
 
     if or_key:
         # Priority: explicit param → env var → config → default
@@ -544,10 +493,6 @@ def call_llm(
         model = llm_model or os.getenv("OPENROUTER_MODEL") or or_settings.get("model", DEFAULT_OPENROUTER_MODEL)
         base_url = or_settings.get("base_url", DEFAULT_OPENROUTER_BASE)
         return openrouter(system, user, or_key, model=model, base_url=base_url, enable_reasoning=enable_reasoning)
-    elif ant_key:
-        return anthropic(system, user, ant_key)
-    elif oai_key:
-        return openai(system, user, oai_key)
     else:
         log("WARN", "No API key found. Trying local Ollama …")
         return ollama(system, user)

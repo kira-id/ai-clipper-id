@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI Video Clipper — Dashboard</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#141925; --panel2:#1b2231; --line:#26304a;
+    --txt:#e6ecff; --dim:#8b97b3; --cyan:#39d0ff; --green:#3ddc84;
+    --yellow:#ffce4d; --red:#ff5d6c; --mag:#c792ff; --accent:#39d0ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#16203a 0%,var(--bg) 60%);
+    color:var(--txt);font:14px/1.5 ui-sans-serif,system-ui,Segoe UI,Roboto,Helvetica,Arial}
+  a{color:var(--cyan)}
+  header{padding:18px 26px;border-bottom:1px solid var(--line);
+    display:flex;align-items:center;gap:14px;background:rgba(20,25,37,.6);backdrop-filter:blur(6px)}
+  header h1{font-size:18px;margin:0;letter-spacing:.3px}
+  header .tag{font-size:11px;color:var(--dim);border:1px solid var(--line);
+    padding:2px 8px;border-radius:999px}
+  .wrap{max-width:1180px;margin:0 auto;padding:22px 26px 80px}
+  .grid{display:grid;grid-template-columns:380px 1fr;gap:22px;align-items:start}
+  @media(max-width:920px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+  .card h2{margin:0 0 14px;font-size:13px;text-transform:uppercase;letter-spacing:1px;color:var(--dim)}
+  label{display:block;font-size:12px;color:var(--dim);margin:12px 0 5px}
+  input[type=file]{width:100%;color:var(--dim);font-size:12px}
+  input[type=text],select,input[type=number]{width:100%;background:var(--panel2);border:1px solid var(--line);
+    color:var(--txt);border-radius:8px;padding:8px 10px;font-size:13px}
+  textarea{width:100%;background:var(--panel2);border:1px solid var(--line);
+    color:var(--txt);border-radius:8px;padding:8px 10px;font-size:12px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;resize:vertical;min-height:140px}
+  .hint{font-size:11px;color:var(--dim);margin-top:4px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
+  .checks{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:8px}
+  .checks label{display:flex;align-items:center;gap:6px;margin:0;color:var(--txt);font-size:12px}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;width:100%;margin-top:16px;
+    background:linear-gradient(180deg,#39d0ff,#1f9fe0);color:#06121c;font-weight:700;border:0;
+    border-radius:10px;padding:12px;font-size:14px;cursor:pointer;transition:.15s}
+  .btn:hover{filter:brightness(1.08)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .drop{border:1.5px dashed var(--line);border-radius:12px;padding:22px;text-align:center;color:var(--dim)}
+  .drop.drag{border-color:var(--cyan);background:rgba(57,208,255,.07);color:var(--txt)}
+  .fname{font-size:12px;color:var(--cyan);margin-top:8px;word-break:break-all}
+  /* stepper */
+  .steps{list-style:none;margin:0;padding:0}
+  .step{display:flex;gap:12px;padding:10px 6px;position:relative}
+  .step:not(:last-child)::before{content:"";position:absolute;left:15px;top:34px;bottom:-2px;width:2px;background:var(--line)}
+  .dot{width:30px;height:30px;border-radius:50%;flex:0 0 30px;display:grid;place-items:center;
+    font-size:13px;font-weight:700;background:var(--panel2);border:2px solid var(--line);color:var(--dim);z-index:1}
+  .step.active .dot{border-color:var(--cyan);color:var(--cyan);box-shadow:0 0 0 4px rgba(57,208,255,.15);animation:pulse 1.4s infinite}
+  .step.done .dot{background:var(--green);border-color:var(--green);color:#06210f}
+  .step.error .dot{background:var(--red);border-color:var(--red);color:#2a0608}
+  .step .meta{min-width:0}
+  .step .name{font-weight:600}
+  .step .detail{font-size:12px;color:var(--dim);word-break:break-word}
+  .step.active .name{color:var(--cyan)}
+  @keyframes pulse{0%{box-shadow:0 0 0 4px rgba(57,208,255,.15)}50%{box-shadow:0 0 0 9px rgba(57,208,255,.04)}100%{box-shadow:0 0 0 4px rgba(57,208,255,.15)}}
+  .bar{height:8px;background:var(--panel2);border-radius:999px;overflow:hidden;margin:4px 0 2px}
+  .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#39d0ff,#3ddc84);transition:width .4s}
+  /* log */
+  .log{background:#070a10;border:1px solid var(--line);border-radius:10px;height:240px;overflow:auto;
+    padding:10px 12px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .log .l{white-space:pre-wrap;word-break:break-word}
+  .log .t{color:#4b5878;margin-right:6px}
+  .INFO{color:#bcd0ff}.OK{color:var(--green)}.WARN{color:var(--yellow)}.ERROR{color:var(--red)}.LLM{color:var(--mag)}
+  /* results */
+  .results{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px}
+  .clip{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .clip video{width:100%;display:block;background:#000;max-height:320px}
+  .clip .body{padding:12px}
+  .clip .rank{font-size:11px;color:var(--dim)}
+  .clip .title{font-weight:700;margin:2px 0 6px}
+  .clip .topic{font-size:12px;color:var(--dim);margin-bottom:8px}
+  .chip{display:inline-block;font-size:11px;padding:2px 8px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);color:var(--cyan);margin-right:6px}
+  .score{float:right;font-weight:800;color:var(--green)}
+  .dl{display:inline-block;margin-top:8px;font-size:12px;text-decoration:none;color:var(--cyan);border:1px solid var(--line);padding:6px 10px;border-radius:8px}
+  .dl:hover{background:var(--panel2)}
+  .empty{color:var(--dim);font-size:13px;padding:10px 2px}
+  .err{color:var(--red);background:rgba(255,93,108,.08);border:1px solid rgba(255,93,108,.4);border-radius:10px;padding:12px;margin-top:12px}
+  .hidden{display:none}
+  .kbd{font:11px ui-monospace,monospace;background:var(--panel2);border:1px solid var(--line);padding:1px 6px;border-radius:5px}
+  /* cache badges + clear buttons */
+  .step .cache{margin-top:4px;display:flex;align-items:center;gap:8px}
+  .badge{font-size:10px;padding:1px 7px;border-radius:999px;border:1px solid var(--line);color:var(--dim)}
+  .badge.on{color:#06210f;background:var(--green);border-color:var(--green)}
+  .badge.off{color:var(--dim)}
+  .clr{font-size:10px;padding:1px 8px;border-radius:7px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--dim);cursor:pointer}
+  .clr:hover{border-color:var(--red);color:var(--red)}
+  .clr:disabled{opacity:.35;cursor:not-allowed}
+  .cachebox{margin-top:14px;display:flex;align-items:center;flex-wrap:wrap;gap:10px}
+  .cachebox .all{margin-left:auto;font-size:11px;padding:5px 12px;border-radius:8px;border:1px solid var(--line);
+    background:var(--panel2);color:var(--red);cursor:pointer}
+  .cachebox .all:hover{background:rgba(255,93,108,.12);border-color:var(--red)}
+  .cachebox .all:disabled{opacity:.35;cursor:not-allowed}
+  .cachebox .lbl{font-size:11px;color:var(--dim)}
+</style>
+</head>
+<body>
+<header>
+  <h1>🎬 AI Video Clipper</h1>
+  <span class="tag">web dashboard</span>
+  <span class="tag" id="health">checking…</span>
+</header>
+
+<div class="wrap">
+  <div class="grid">
+    <!-- LEFT: input form -->
+    <div class="card">
+      <h2>Input</h2>
+      <form id="form">
+        <div class="drop" id="drop">
+          <div>Drop a video here or</div>
+          <input type="file" id="file" name="video" accept="video/*" />
+          <div class="fname" id="fname"></div>
+        </div>
+
+        <div class="checks" style="margin-top:10px">
+          <label><input type="checkbox" id="useLocal" value="on"> Use a local file path (skip upload, read directly)</label>
+        </div>
+        <div id="localBox" class="hidden" style="margin-top:8px">
+          <label>Local file path (absolute)</label>
+          <input type="text" id="local_path" name="local_path"
+            placeholder="C:\Users\SAMI\Videos\big_video.mp4" />
+          <div class="hint">Use this when the video is already on this machine. The dashboard reads it directly from disk — no upload, no copy. Leave empty to upload normally.</div>
+        </div>
+
+        <label>Whisper model</label>
+        <select name="model">
+          <option value="tiny" selected>tiny</option>
+          <option value="base">base</option>
+          <option value="small">small</option>
+          <option value="medium">medium</option>
+          <option value="large-v3">large-v3</option>
+          <option value="turbo">turbo</option>
+        </select>
+
+        <div class="row">
+          <div><label>Language</label>
+            <select name="lang">
+              <option value="id">id (Indonesian)</option>
+              <option value="en">en (English)</option>
+              <option value="none" selected>auto-detect</option>
+            </select></div>
+          <div><label>Device</label>
+            <select name="device">
+              <option value="auto" selected>auto</option>
+              <option value="cuda">cuda</option>
+              <option value="cpu">cpu</option>
+            </select></div>
+        </div>
+
+        <div class="row3">
+          <div><label>Min s</label><input name="min" type="number" value="15"></div>
+          <div><label>Max s</label><input name="max" type="number" value="60"></div>
+          <div><label>Max clips</label><input name="max_clips" type="number" value="10"></div>
+        </div>
+        <div class="row">
+          <div><label>Min score</label><input name="min_score" type="number" value="55"></div>
+          <div><label>Subtitle pos</label>
+            <select name="subtitle_position">
+              <option value="lower" selected>lower</option>
+              <option value="center">center</option>
+              <option value="upper">upper</option>
+            </select></div>
+        </div>
+
+        <label>Enhancements</label>
+        <div class="checks">
+          <label><input type="checkbox" name="subtitles" value="on" checked> Subtitles</label>
+          <label><input type="checkbox" name="title" value="on" checked> Title overlay</label>
+          <label><input type="checkbox" name="crop" value="on" checked> Person crop</label>
+          <label><input type="checkbox" name="remove_silence" value="on" checked> Remove silence</label>
+          <label><input type="checkbox" name="cta" value="on"> IG CTA</label>
+        </div>
+
+        <label>Orientation</label>
+        <select name="orientation">
+          <option value="auto">auto (keep original)</option>
+          <option value="portrait" selected>portrait (9:16)</option>
+          <option value="landscape">landscape (16:9)</option>
+        </select>
+
+        <label>Translate to</label>
+        <select name="translate_preset">
+          <option value="en">English</option>
+          <option value="id" selected>Indonesian (Bahasa)</option>
+          <option value="auto">Keep original language</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input name="target_language" id="target_language" class="hidden"
+          type="text" placeholder="e.g. Japanese, Spanish, French…" >
+        <div class="hint hidden" id="tl_hint">Open language: clips, captions, and subtitles are translated into whatever you type. Leave empty to default to English.</div>
+
+        <label>LLM model (optional override)</label>
+        <input name="llm_model" type="text" placeholder="e.g. openrouter/free">
+
+        <label>Clip selection prompt</label>
+        <select name="prompt_variant">
+          <option value="default" selected>Educational (default)</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <textarea name="system_prompt" id="system_prompt" class="hidden"
+          placeholder="Paste a custom system prompt. The placeholders {min_dur}, {max_dur}, {max_clips}, {min_score} are filled in automatically."></textarea>
+        <div class="hint hidden" id="prompt_hint">Custom prompt is sent verbatim to the LLM (the {min_dur}/{max_dur}/{max_clips}/{min_score} tokens are replaced). Leave blank to use the default educational prompt.</div>
+
+        <button class="btn" id="go" type="submit">▶ Process video</button>
+      </form>
+    </div>
+
+    <!-- RIGHT: visualization + output -->
+    <div style="display:flex;flex-direction:column;gap:22px">
+      <div class="card">
+        <h2>Pipeline · step by step</h2>
+        <div class="bar"><i id="bar"></i></div>
+        <div style="font-size:12px;color:var(--dim);margin:4px 0 10px" id="pct">0%</div>
+        <ol class="steps" id="steps">
+          <li class="step" data-s="upload"><span class="dot">1</span><div class="meta"><div class="name">Upload</div><div class="detail">awaiting file…</div></div></li>
+          <li class="step" data-s="transcribe"><span class="dot">2</span><div class="meta"><div class="name">Transcribe</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="transcribe">cache</span><button class="clr" data-clr="transcribe" disabled>clear</button></div></div></li>
+          <li class="step" data-s="prefilter"><span class="dot">3</span><div class="meta"><div class="name">Pre-filter</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="prefilter">cache</span><button class="clr" data-clr="prefilter" disabled>clear</button></div></div></li>
+          <li class="step" data-s="energy"><span class="dot">4</span><div class="meta"><div class="name">Audio energy</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="energy">cache</span><button class="clr" data-clr="energy" disabled>clear</button></div></div></li>
+          <li class="step" data-s="llm_select"><span class="dot">5</span><div class="meta"><div class="name">LLM clip selection</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="llm_select">cache</span><button class="clr" data-clr="llm_select" disabled>clear</button></div></div></li>
+          <li class="step" data-s="refine"><span class="dot">6</span><div class="meta"><div class="name">Refine & improve</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="refine">cache</span><button class="clr" data-clr="refine" disabled>clear</button></div></div></li>
+          <li class="step" data-s="extract"><span class="dot">7</span><div class="meta"><div class="name">Extract clips</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="extract">cache</span><button class="clr" data-clr="extract" disabled>clear</button></div></div></li>
+          <li class="step" data-s="render"><span class="dot">8</span><div class="meta"><div class="name">Render (subs/crop)</div><div class="detail">—</div><div class="cache"><span class="badge off" data-c="render">cache</span><button class="clr" data-clr="render" disabled>clear</button></div></div></li>
+          <li class="step" data-s="done"><span class="dot">✓</span><div class="meta"><div class="name">Done</div><div class="detail">—</div></div></li>
+        </ol>
+        <div class="cachebox" id="cachebox">
+          <span class="lbl">Pipeline cache:</span>
+          <button class="all" id="clearAll" disabled>🗑 Clear all cache</button>
+        </div>
+        <div class="err hidden" id="err"></div>
+        <div id="retryBox" class="hidden">
+          <button class="btn" id="retry" type="button" style="margin-top:12px">↻ Retry with relaxed settings</button>
+          <div style="font-size:12px;color:var(--dim);margin-top:8px">
+            Re-runs the <b>same upload</b> with a lower min-score, wider duration range,
+            and more candidate clips. No re-upload needed.
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Live log</h2>
+        <div class="log" id="log"><div class="l dim">No job running yet.</div></div>
+      </div>
+
+      <div class="card">
+        <h2>Output files</h2>
+        <div id="results"><div class="empty">Clips will appear here when ready.</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const steps = [...document.querySelectorAll('.step')];
+let pollTimer = null;
+let currentJobId = null;
+
+// ── health ──
+fetch('/health').then(r=>r.json()).then(()=>$('#health').textContent='online')
+  .catch(()=>$('#health').textContent='offline');
+
+// ── custom prompt toggle ──
+const promptVariant = $('select[name="prompt_variant"]');
+const systemPrompt = $('#system_prompt');
+const promptHint = $('#prompt_hint');
+let _defaultPrompt = '';
+async function loadDefaultPrompt(){
+  try{
+    const r = await fetch('/api/prompt-default');
+    const d = await r.json();
+    _defaultPrompt = d.prompt || '';
+  }catch(e){ /* ignore */ }
+}
+function syncPromptUI(){
+  const custom = promptVariant.value === 'custom';
+  systemPrompt.classList.toggle('hidden', !custom);
+  promptHint.classList.toggle('hidden', !custom);
+  if(custom && !systemPrompt.value.trim() && _defaultPrompt){
+    systemPrompt.value = _defaultPrompt;
+  }
+}
+promptVariant.addEventListener('change', syncPromptUI);
+loadDefaultPrompt().then(syncPromptUI);
+
+// ── translate target toggle ──
+const translatePreset = $('select[name="translate_preset"]');
+const targetLangInput = $('#target_language');
+const tlHint = $('#tl_hint');
+function syncTranslateUI(){
+  const custom = translatePreset.value === 'custom';
+  targetLangInput.classList.toggle('hidden', !custom);
+  tlHint.classList.toggle('hidden', !custom);
+}
+translatePreset.addEventListener('change', syncTranslateUI);
+syncTranslateUI();
+
+// ── drag & drop ──
+const drop = $('#drop'), fileInput = $('#file');
+['dragenter','dragover'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('drag')}));
+drop.addEventListener('drop',ev=>{ if(ev.dataTransfer.files[0]){fileInput.files=ev.dataTransfer.files; showName();}});
+fileInput.addEventListener('change',showName);
+function showName(){ const f=fileInput.files[0]; $('#fname').textContent = f? f.name : ''; }
+
+// ── submit ──
+$('#form').addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  const useLocal = $('#useLocal').checked;
+  const fd = new FormData();
+  let localPath = '';
+  if(useLocal){
+    localPath = $('#local_path').value.trim();
+    if(!localPath){ alert('Enter a local file path, or uncheck "use local path".'); return; }
+    fd.append('local_path', localPath);
+  } else {
+    const f = fileInput.files[0];
+    if(!f){ alert('Choose a video file first.'); return; }
+    fd.append('video', f);
+  }
+  // Resolve the final target language from the translate preset + custom field.
+  const preset = translatePreset.value;
+  let target = (preset === 'custom')
+    ? (targetLangInput.value.trim() || 'en')
+    : preset;
+  // copy all form fields (target_language is overridden below; local_path is
+  // already appended above so we skip it here to avoid a duplicate)
+  new FormData($('#form')).forEach((v,k)=>{
+    if(k!=='video' && k!=='target_language' && k!=='local_path') fd.append(k, v);
+  });
+  fd.append('target_language', target);
+  resetUI();
+  $('#go').disabled = true; $('#go').textContent='⏳ Processing…';
+  try{
+  const res = await fetch('/api/process',{method:'POST',body:fd});
+  const data = await res.json();
+  if(data.error){ showError(data.error); return; }
+  currentJobId = data.job_id;
+  startPolling(data.job_id);
+  }catch(err){ showError(err.message); }
+});
+
+// ── local path toggle ──
+const useLocalEl = $('#useLocal');
+const localBox = $('#localBox');
+useLocalEl.addEventListener('change', ()=>{
+  localBox.classList.toggle('hidden', !useLocalEl.checked);
+  fileInput.disabled = useLocalEl.checked;
+});
+
+function resetUI(){
+  steps.forEach(s=>s.className='step');
+  $('#bar').style.width='0%'; $('#pct').textContent='0%';
+  $('#log').innerHTML=''; $('#results').innerHTML='<div class="empty">Clips will appear here when ready.</div>';
+  $('#err').classList.add('hidden'); $('#err').textContent='';
+  $('#retryBox').classList.add('hidden');
+}
+
+function startPolling(jobId){
+  if(pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(()=>poll(jobId), 1200);
+  poll(jobId);
+}
+async function poll(jobId){
+  try{
+    const r = await fetch('/api/job/'+jobId); const s = await r.json();
+    render(s);
+    if(s.finished){ clearInterval(pollTimer); pollTimer=null;
+      $('#go').disabled=false; $('#go').textContent='▶ Process video'; }
+  }catch(e){ /* ignore */ }
+}
+
+function render(s){
+  // progress
+  $('#bar').style.width = s.progress+'%';
+  $('#pct').textContent = s.progress+'%';
+  // steps
+  steps.forEach(el=>{
+    const k = el.dataset.s;
+    const st = s.status[k];
+    el.className = 'step' + (st==='active'?' active':st==='done'?' done':st==='error'?' error':'');
+    const d = el.querySelector('.detail');
+    if(s.detail[k]) d.textContent = s.detail[k];
+    else if(st==='pending') d.textContent='—';
+  });
+  // cache badges + clear buttons
+  const cache = s.cache || {};
+  const clearable = !!currentJobId;
+  document.querySelectorAll('[data-c]').forEach(b=>{
+    const k = b.dataset.c;
+    const on = !!cache[k];
+    b.className = 'badge ' + (on ? 'on' : 'off');
+    b.textContent = on ? 'cached' : 'no cache';
+  });
+  document.querySelectorAll('[data-clr]').forEach(btn=>{
+    const k = btn.dataset.clr;
+    btn.disabled = !clearable || !cache[k];
+  });
+  const clearAll = $('#clearAll');
+  if(clearAll) clearAll.disabled = !clearable || !Object.values(cache).some(Boolean);
+  // log
+  const log = $('#log');
+  const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 30;
+  log.innerHTML = s.logs.map(l=>
+    `<div class="l ${l.level}"><span class="t">${l.t}s</span>${escapeHtml(l.msg)}</div>`).join('');
+  if(atBottom) log.scrollTop = log.scrollHeight;
+  // error
+  if(s.error){ showError(s.error); }
+  // results
+  if(s.outputs && s.outputs.length){
+    const box = $('#results');
+    if(!box.dataset.rendered || box.dataset.job!==s.id){
+      box.dataset.job=s.id; box.dataset.rendered='1';
+      box.innerHTML='';
+      s.outputs.forEach(o=>{
+        if(!o.path) return;
+        const url = '/files/'+s.id+'/'+encodeURIComponent(o.filename);
+        const card=document.createElement('div'); card.className='clip';
+        card.innerHTML = `
+          <video src="${url}" controls preload="metadata" playsinline></video>
+          <div class="body">
+            <div class="rank">#${o.rank} · ${fmt(o.start)}–${fmt(o.end)}s · ${o.size_mb?o.size_mb+'MB':''}</div>
+            <div class="title">${escapeHtml(o.title||'')}<span class="score">${o.score??''}</span></div>
+            <div class="topic">${escapeHtml(o.topic||'')}</div>
+            <span class="chip">download</span>
+            <a class="dl" href="${url}" download="${o.filename}">⬇ ${o.filename}</a>
+          </div>`;
+        box.appendChild(card);
+      });
+    }
+  }
+}
+function showError(m){ const e=$('#err'); e.classList.remove('hidden'); e.textContent='⚠ '+m;
+  if(currentJobId){ $('#retryBox').classList.remove('hidden'); } }
+function fmt(s){ return s==null?'':(Math.round(s*10)/10)+''; }
+function escapeHtml(x){ return (x||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// ── cache clear (explicit, user-initiated) ──
+async function clearCache(step){
+  if(!currentJobId) return;
+  const url = step ? `/api/clear-cache/${currentJobId}/${step}`
+                   : `/api/clear-cache/${currentJobId}`;
+  try{
+    const res = await fetch(url, {method:'POST'});
+    const d = await res.json();
+    if(d.ok){
+      // refresh badge state immediately (server reflects cleared cache)
+      if(step){
+        const b = document.querySelector(`[data-c="${step}"]`);
+        if(b){ b.className='badge off'; b.textContent='no cache'; }
+        const btn = document.querySelector(`[data-clr="${step}"]`);
+        if(btn) btn.disabled = true;
+      } else {
+        document.querySelectorAll('[data-c]').forEach(b=>{
+          b.className='badge off'; b.textContent='no cache'; });
+        document.querySelectorAll('[data-clr]').forEach(btn=>btn.disabled=true);
+      }
+      const all = $('#clearAll');
+      if(all) all.disabled = true;
+    } else {
+      showError('Failed to clear cache: ' + (d.error||'unknown'));
+    }
+  }catch(err){ showError(err.message); }
+}
+document.querySelectorAll('[data-clr]').forEach(btn=>{
+  btn.addEventListener('click', ()=>clearCache(btn.dataset.clr));
+});
+const clearAllBtn = $('#clearAll');
+if(clearAllBtn) clearAllBtn.addEventListener('click', ()=>clearCache(null));
+
+// ── retry (explicit, user-initiated; same upload, relaxed params) ──
+$('#retry').addEventListener('click', async ()=>{
+  if(!currentJobId) return;
+  $('#retryBox').classList.add('hidden');
+  resetUI();
+  $('#go').disabled = true; $('#go').textContent='⏳ Retrying…';
+  const ov = { min_score: 20, min: 5, max: 90, max_clips: 10 };
+  try{
+    const res = await fetch('/api/retry/'+currentJobId,{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(ov)});
+    const data = await res.json();
+    if(data.error){ showError(data.error); $('#go').disabled=false; $('#go').textContent='▶ Process video'; return; }
+    currentJobId = data.job_id;
+    startPolling(data.job_id);
+  }catch(err){ showError(err.message); $('#go').disabled=false; $('#go').textContent='▶ Process video'; }
+});
+</script>
+</body>
+</html>

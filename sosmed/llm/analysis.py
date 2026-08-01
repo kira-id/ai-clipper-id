@@ -2,9 +2,11 @@
 LLM analysis: find engaging clips in transcript.
 """
 
+import hashlib
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +24,17 @@ def _build_transcript_text(
     Format: [start-end] text [marker] [gap]
     - Gaps >1.0s marked with [PAUSE] to indicate sentence boundaries
     - Energy spikes/high moments annotated with [ENERGY SPIKE] / [HIGH ENERGY]
+    - Non-verbal energy clusters (no overlapping transcript line, in_speech
+      False) are listed in a trailing section so the LLM can still clip a
+      genuine scream/reaction Whisper failed to transcribe, without
+      misattributing it to a nearby spoken line.
     """
     # Pre-sort energy events by start time for efficient lookup via pointer scan
     sorted_energy = sorted(energy_events, key=lambda e: e["start"]) if energy_events else []
 
     lines: list[str] = []
-    ev_ptr = 0  # pointer into sorted_energy ��� advances as segments progress
+    ev_ptr = 0  # pointer into sorted_energy — advances as segments progress
+    used_for_line: set[int] = set()
     for i, s in enumerate(segments):
         st = f"{s['start']:.0f}" if s['start'] == int(s['start']) else f"{s['start']:.1f}"
         en = f"{s['end']:.0f}" if s['end'] == int(s['end']) else f"{s['end']:.1f}"
@@ -46,6 +53,7 @@ def _build_transcript_text(
                 # Overlap confirmed
                 label = "🔥 ENERGY SPIKE" if ev["kind"] == "spike" else "⚡ HIGH ENERGY"
                 energy_marker = f" [{label}]"
+                used_for_line.add(j)
                 break
 
         # Gap to next segment for sentence boundary detection
@@ -58,6 +66,20 @@ def _build_transcript_text(
                 gap_marker = f" [gap {gap:.2f}s]"
 
         lines.append(f"[{st}-{en}]{s['text']}{energy_marker}{gap_marker}")
+
+    # Trailing section: non-verbal energy moments (no overlapping spoken line).
+    unmatched = [
+        ev for j, ev in enumerate(sorted_energy)
+        if j not in used_for_line and not ev.get("in_speech", True)
+    ]
+    if unmatched:
+        lines.append("")
+        lines.append("[NON-VERBAL ENERGY MOMENTS — sudden loud reactions with no transcript; "
+                     "clip these standalone, do NOT attach to nearby text]")
+        for ev in unmatched:
+            label = "🔥 ENERGY SPIKE" if ev["kind"] == "spike" else "⚡ HIGH ENERGY"
+            lines.append(f"[{ev['start']:.1f}-{ev['end']:.1f}] {label}")
+
     return "\n".join(lines)
 
 
@@ -112,9 +134,9 @@ def _build_user_prompt(
 ) -> str:
     """Build the user prompt for LLM."""
     header = (
-        f"Analyze this transcript and extract ONLY clips with top-tier viral potential.\n"
-        f"Prioritize shareability, comment bait, replay value, and emotional punch over pure informativeness.\n"
-        f"Reject clips that are merely useful or interesting but not likely to spread.\n"
+        f"Analyze this transcript and extract ONLY clips with genuine educational value.\n"
+        f"Prioritize clear explanations, useful lessons, how-tos, and demonstrable skill over pure entertainment.\n"
+        f"Filter out clips that are merely amusing or interesting but teach nothing.\n"
         f"Duration: {min_dur}–{max_dur}s. Max {max_clips} clips. clip_score ≥ {min_score}.\n"
     )
     if chunk_info:
@@ -124,9 +146,9 @@ def _build_user_prompt(
 
 def _compute_clip_score(c: dict[str, Any]) -> float:
     """
-    Compute clip_score using emotion-first gaming weighting.
+    Compute clip_score using education-first weighting.
 
-    Weights: emotion 40%, hook 30%, retention 20%, personality 10%.
+    Weights: educational clarity 40%, hook 30%, retention 20%, teaching voice 10%.
     Falls back to legacy field names if new ones are missing.
     """
     scores = _normalize_score_fields(c)
@@ -457,6 +479,48 @@ def _segments_in_range(
     return [s for s in segments if s["end"] > start and s["start"] < end]
 
 
+def _resolve_raw_cache_path(
+    raw_clips_cache_file: "str | Path | None",
+    *,
+    min_duration: int,
+    max_duration: int,
+    max_clips: int,
+    min_score: int,
+    chunk_duration: float,
+    chunk_overlap: float,
+    n_segments: int,
+    system_prompt: str | None = None,
+) -> "Path | None":
+    """Resolve the param-aware raw-clip cache path (deterministic, single pass).
+
+    The caller passes a *base* path. We fold the LLM-affecting parameters into a
+    short hash so changing them never silently reuses stale LLM output. This is
+    the ONLY place the transformation happens — read and write both call it, so
+    the two sides can never drift (a double-transform would otherwise read
+    `base.sig.json` but write `base.sig.sig.json` and always miss).
+    """
+    if not raw_clips_cache_file:
+        return None
+    p = Path(raw_clips_cache_file)
+    if p.suffix != ".json":
+        return p
+    params_sig = json.dumps(
+        {
+            "min_duration": min_duration,
+            "max_duration": max_duration,
+            "max_clips": max_clips,
+            "min_score": min_score,
+            "chunk_duration": chunk_duration,
+            "chunk_overlap": chunk_overlap,
+            "n_segments": n_segments,
+            "system_prompt": system_prompt or "",
+        },
+        sort_keys=True,
+    )
+    sig = hashlib.sha1(params_sig.encode("utf-8")).hexdigest()[:10]
+    return p.with_name(f"{p.stem}.{sig}{p.suffix}")
+
+
 def find_clips(
     segments: list[dict[str, Any]],
     *,
@@ -471,6 +535,8 @@ def find_clips(
     chunk_overlap: float = 60.0,
     raw_clips_cache_file: str | Path | None = None,
     energy_events: list[dict[str, Any]] | None = None,
+    llm_parallel: bool = False,
+    system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Ask LLM to find ALL engaging clips (up to *max_clips*).
@@ -486,11 +552,29 @@ def find_clips(
     instead of calling LLM again.
     """
     if raw_clips_cache_file:
-        raw_clips_cache_file = Path(raw_clips_cache_file)
+        raw_clips_cache_file = _resolve_raw_cache_path(
+            raw_clips_cache_file,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            max_clips=max_clips,
+            min_score=min_score,
+            chunk_duration=chunk_duration,
+            chunk_overlap=chunk_overlap,
+            n_segments=len(segments),
+            system_prompt=system_prompt,
+        )
         if raw_clips_cache_file.exists():
-            log("INFO", f"Loading cached raw LLM clips from {raw_clips_cache_file}")
-            all_raw_clips = json.loads(raw_clips_cache_file.read_text())
-            log("OK", f"Loaded {len(all_raw_clips)} raw clips from cache (skipped LLM calls)")
+            text = raw_clips_cache_file.read_text(encoding="utf-8")
+            if not text.strip():
+                log("WARN", f"Cache file {raw_clips_cache_file} is empty — treating as cache miss")
+                all_raw_clips = None
+            else:
+                try:
+                    all_raw_clips = json.loads(text)
+                    log("OK", f"Loaded {len(all_raw_clips)} raw clips from cache (skipped LLM calls)")
+                except json.JSONDecodeError as e:
+                    log("WARN", f"Cache file {raw_clips_cache_file} is corrupt ({e}) — treating as cache miss")
+                    all_raw_clips = None
         else:
             # Will generate and cache below
             all_raw_clips = None
@@ -502,17 +586,46 @@ def find_clips(
         # Split into chunks for iterative processing
         chunks = _chunk_segments(segments, chunk_duration, chunk_overlap)
 
-        system = SYSTEM_PROMPT.format(
+        effective_prompt = system_prompt if system_prompt else SYSTEM_PROMPT
+        system = effective_prompt.format(
             min_dur=min_duration,
             max_dur=max_duration,
             max_clips=max_clips,
             min_score=min_score,
         )
 
-        all_raw_clips = []
         n_chunks = len(chunks)
 
-        for idx, chunk in enumerate(chunks, 1):
+        def _process_chunk(idx: int, chunk: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            """Build the prompt for one chunk and call the LLM. Returns raw clips.
+
+            On a parse failure that yields 0 clips from a non-empty chunk, we
+            retry ONCE with the chunk split in half. A failed (e.g. reasoning
+            model that dumps CoT into content) call otherwise silently loses
+            the whole time range — in the observed run chunk 3/3 returned 0
+            clips, dropping ~356s (716s–1072s) of the video with no recovery.
+            """
+            raw_clips = _call_chunk_llm(idx, chunk, min_duration, max_duration,
+                                        max_clips, min_score, n_chunks)
+            if not raw_clips and len(chunk) > 1:
+                # Recover: split this chunk and try each half once.
+                mid = len(chunk) // 2
+                log("WARN", f"Chunk {idx}/{n_chunks} returned 0 clips — "
+                            f"retrying with halved sub-chunks to recover coverage")
+                halves = [chunk[:mid], chunk[mid:]]
+                recovered: list[dict[str, Any]] = []
+                for h_i, half in enumerate(halves, 1):
+                    sub = _call_chunk_llm(f"{idx}.{h_i}", half, min_duration,
+                                          max_duration, max_clips, min_score, n_chunks)
+                    recovered.extend(sub)
+                log("OK", f"Chunk {idx}/{n_chunks} recovered {len(recovered)} clips "
+                          f"from halved sub-chunks")
+                return recovered
+            return raw_clips
+
+        def _call_chunk_llm(idx, chunk, min_duration, max_duration, max_clips,
+                            min_score, n_chunks) -> list[dict[str, Any]]:
+            """Single LLM attempt for a (sub-)chunk."""
             chunk_start = chunk[0]["start"]
             chunk_end = chunk[-1]["end"]
             # Generous per-chunk budget — maximize output
@@ -525,7 +638,7 @@ def find_clips(
                 chunk_info = (
                     f"Ini bagian {idx}/{n_chunks} video "
                     f"({chunk_start:.0f}s-{chunk_end:.0f}s). "
-                    f"Ekstrak SEMUA momen menarik di bagian ini — setiap subtopik yang layak harus jadi klip."
+                    f"Ekstrak momen edukatif di bagian ini — hanya bagian yang benar-benar mengajarkan sesuatu yang layak jadi klip."
                 )
                 log("INFO", f"Chunk {idx}/{n_chunks}: {chunk_start:.0f}s → {chunk_end:.0f}s "
                            f"({len(chunk)} segments, asking for ≤{clips_per_chunk} clips)")
@@ -537,15 +650,42 @@ def find_clips(
 
             raw_clips = call_llm(system, user, api_key, llm_model)
             log("OK", f"Chunk {idx}/{n_chunks}: LLM returned {len(raw_clips)} clips")
-            all_raw_clips.extend(raw_clips)
+            return raw_clips
+
+        all_raw_clips: list[dict[str, Any]] = []
+        if llm_parallel and n_chunks > 1:
+            # Run chunks concurrently — the OpenAI client is thread-safe and the
+            # chunks are independent, so this collapses N serial calls into ~1 call
+            # of wall-clock time (bounded by the slowest single chunk).
+            log("INFO", f"Running {n_chunks} chunks in PARALLEL")
+            results_by_idx: dict[int, list[dict[str, Any]]] = {}
+            with ThreadPoolExecutor(max_workers=min(n_chunks, 4)) as pool:
+                futures = {
+                    pool.submit(_process_chunk, idx, chunk): idx
+                    for idx, chunk in enumerate(chunks, 1)
+                }
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        results_by_idx[idx] = fut.result()
+                    except Exception as e:  # surface but don't silently drop
+                        log("ERROR", f"Chunk {idx} failed: {e}")
+                        results_by_idx[idx] = []
+            # Preserve chunk order so merged output stays deterministic
+            for idx in range(1, n_chunks + 1):
+                all_raw_clips.extend(results_by_idx.get(idx, []))
+        else:
+            for idx, chunk in enumerate(chunks, 1):
+                all_raw_clips.extend(_process_chunk(idx, chunk))
 
         log("INFO", f"Total raw clips from {n_chunks} chunk(s): {len(all_raw_clips)}")
-        
-        # Cache raw results for future runs
+
+        # Cache raw results for future runs. raw_clips_cache_file is already the
+        # fully-resolved param-aware path (set on the read side above), so we
+        # write to it directly — re-resolving here would double-hash the name.
         if raw_clips_cache_file:
-            raw_clips_cache_file = Path(raw_clips_cache_file)
             raw_clips_cache_file.parent.mkdir(parents=True, exist_ok=True)
-            raw_clips_cache_file.write_text(json.dumps(all_raw_clips, indent=2, ensure_ascii=False))
+            raw_clips_cache_file.write_text(json.dumps(all_raw_clips, indent=2, ensure_ascii=False), encoding="utf-8")
             log("OK", f"Cached {len(all_raw_clips)} raw LLM clips → {raw_clips_cache_file}")
 
     # Merge, deduplicate, and validate across all chunks

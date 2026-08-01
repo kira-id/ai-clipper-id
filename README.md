@@ -2,12 +2,34 @@
 
 An intelligent video-to-clips converter that uses AI transcription and LLM analysis to automatically extract engaging short clips from longer videos. Optimized for Indonesian-language content.
 
+## Web Dashboard
+
+A browser dashboard where you upload a video, watch the pipeline run step by step, and download the resulting clips — no CLI needed.
+
+```bash
+python web_app.py                # serves on http://localhost:8000
+python web_app.py --port 8080    # custom port
+python web_app.py --host 0.0.0.0 # expose on your LAN
+```
+
+Open the printed URL. The dashboard shows the 9 pipeline stages as a live stepper
+(upload → transcribe → prefilter → audio-energy → LLM-select → refine → extract →
+render → done), a streaming log, and the finished clips with inline preview + download.
+Output clips are written to `clips/<VideoName>/`.
+
+**No extra dependencies** — the dashboard is pure Python stdlib (`http.server`). The long
+pipeline steps run in a background thread; the browser polls `/api/job/<id>` every ~1s.
+
+> The dashboard drives the exact same pipeline as `main.py` (`sosmed/web_runner.py`
+> wraps `transcribe → prefilter → audio energy → find_clips → refine → extract →
+> postprocess`). LLM settings come from `config.yaml` / `.env` exactly like the CLI.
+
 ## Features
 
 - 🎬 **Automatic Transcription** — Uses `faster-whisper` for accurate, fast speech-to-text (GPU/CPU auto-detection)
 - 🧠 **AI-Powered Clip Extraction** — LLM automatically decides which segments are most engaging (max 100 clips)
 - 🇮🇩 **Indonesian Optimized** — Pre-filters noise, filler words, and duplicates tuned for Bahasa Indonesia
-- 🎵 **Music/Lyrics Filtering** — Automatically filters out pure instrumental sections and background music from clip analysis
+- 🎵 **Music/Lyrics Filtering** — Automatically filters out pure instrumental sections from clip analysis
 - ⚡ **Sequential FFmpeg Processing** — Clips are extracted and post‑processed one at a time to avoid running multiple FFmpeg instances concurrently
 - 🔌 **Multi-LLM Support** — Works with OpenRouter, Anthropic, OpenAI, or Ollama
 - 📊 **Smart Ranking** — Clips are ranked by engagement score with compelling hooks extracted
@@ -27,7 +49,7 @@ sosmed/
 │   ├── postprocess.py   # Post-processing orchestrator
 │   ├── reframe.py       # Smart 9:16 portrait reframing
 │   ├── subtitles.py     # TikTok-style ASS subtitle generation
-│   ├── postprocess.py   # Apply subtitles (formerly also handled music/SFX)
+│   ├── postprocess.py   # Apply subtitles and other visual/audio cleanup
 │   ├── utils.py         # Logging, constants, prompts
 │   └── llm/             # LLM analysis backends
 ├── clips/
@@ -79,9 +101,7 @@ conda install -c pytorch pytorch torchvision torchaudio
 
 **LLM Priority:** The script automatically uses available LLM providers in this order:
 1. **OpenRouter** (free default) — Set `OPENROUTER_API_KEY` environment variable
-2. **Anthropic** — Set `ANTHROPIC_API_KEY` environment variable
-3. **OpenAI** — Set `OPENAI_API_KEY` environment variable
-4. **Ollama** — Run locally (no API key needed)
+2. **Ollama** — Run locally (no API key needed)
 
 Example:
 ```bash
@@ -139,8 +159,7 @@ python main.py video.mp4
 | `--lang` | id | Language code (e.g., `id` for Indonesian) |
 | `--reframe` / `--no-reframe` | on | Portrait (9:16) reframe with face detection |
 | `--subtitles` / `--no-subtitles` | on | TikTok-style word-by-word subtitles |
-| `--music FILE` | none | Background music file (MP3/WAV/M4A) (option removed) |
-| `--sfx` / `--no-sfx` | on | Transition sound effects (removed) |
+| `--target-language` | en | Language to translate clip titles, captions, and subtitles into. `en`=English, `id`=Indonesian, `auto`=keep the original/transcribed language (only fixes transcription errors), or any language label/code (e.g. `Spanish`, `Japanese`) for an open/custom target |
 | `--subtitle-position` | center | Subtitle position: `center`, `upper`, `lower` |
 
 ## Output
@@ -205,26 +224,22 @@ Word-by-word highlighted subtitles burned directly into the video.
 - Positioned center-screen (customizable with `--subtitle-position`)
 - Disable with `--no-subtitles`
 
-*Previous versions of the tool also supported background music and transition sound effects
-(the code has since been simplified; audio mixing is no longer performed).*
 ## Example Workflow
 
 ```bash
-# Full production pipeline: portrait + subtitles + music + SFX
+# Full production pipeline: portrait + subtitles
 python main.py "videos/AI di Dunia Industri [AI Webinar Series - Eps 1].mp4" \
-  --lang id --music ~/music/upbeat-lofi.mp3
+  --lang id
 
 # Quick preview (no post-processing)
 python main.py video.mp4 --no-reframe --no-subtitles --no-sfx
 
-# Portrait clips with subtitles, no music
+# Portrait clips with subtitles
 python main.py video.mp4 --model large-v3
 
 # Results appear in clips/ with:
 # - Portrait (9:16) reframed clips ready for TikTok/Reels/Shorts
 # - Word-by-word highlighted subtitles burned in
-# - Background music auto-ducked under speech
-# - Transition SFX for high-energy feel
 # - clips.json with metadata, timestamps, and hooks
 ```
 

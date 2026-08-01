@@ -17,9 +17,9 @@ def _rgb_to_ass(r: int, g: int, b: int, a: int = 0) -> str:
 
 
 COLOR_HIGHLIGHT = _rgb_to_ass(255, 225, 53)      # Yellow (current word)
-COLOR_NORMAL    = _rgb_to_ass(255, 255, 255)      # White (other words)
-COLOR_OUTLINE   = _rgb_to_ass(0, 0, 0)            # Black outline
-COLOR_SHADOW    = _rgb_to_ass(0, 0, 0, 80)        # Subtle shadow
+COLOR_NORMAL    = _rgb_to_ass(0, 0, 0)            # Black (other words)
+COLOR_OUTLINE   = _rgb_to_ass(255, 255, 255)      # White outline (halo → readable on dark bg)
+COLOR_GLOW      = _rgb_to_ass(255, 255, 255, 90)  # White glow (soft halo)
 
 
 def _seconds_to_ass_time(seconds: float) -> str:
@@ -76,10 +76,13 @@ def _adapt_for_aspect_ratio(
     play_res_y: int,
     font_size_pct: float,
 ) -> float:
-    """Increase font percentage for landscape / square video."""
+    """Scale font percentage: bump it for portrait (narrow) frames so the
+    text stays large and legible, and slightly enlarge for landscape/square.
+    """
     aspect = play_res_x / max(1, play_res_y)
-    if aspect <= 1.0:
-        return font_size_pct
+    if aspect < 1.0:
+        # Portrait: narrow width → grow font so it fills the frame
+        return font_size_pct * (1.0 + (1.0 - aspect) * 0.8)
     return font_size_pct * (1.0 + (aspect - 1.0) * 1.3)
 
 
@@ -90,7 +93,7 @@ def _resolve_font_size(play_res_y: int, font_size_pct: float) -> int:
 
 def _resolve_outline(play_res_y: int, font_size_pct: float) -> int:
     """Scale outline thickness relative to resolution and font size."""
-    return max(2, round(play_res_y * font_size_pct * 0.06 / 100.0))
+    return max(2, round(play_res_y * font_size_pct * 0.07 / 100.0))
 
 
 def generate_ass_subtitles(
@@ -98,7 +101,7 @@ def generate_ass_subtitles(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat",
-    font_size_pct: float = 2.8,
+    font_size_pct: float = 3.6,
     highlight_color: str | None = None,
     normal_color: str | None = None,
     position: str = "lower",
@@ -108,17 +111,17 @@ def generate_ass_subtitles(
     """Generate ASS subtitles with word-by-word yellow highlight.
 
     Design choices for professional shorts:
-    - **Single line** max (no two-line subtitles)
+    - **Single line** max (no two-line subtitles) — WrapStyle:2 keeps long
+      groups on one line with ellipsis rather than overflowing the frame
     - **Word-by-word highlight**: each word turns yellow when spoken,
       NOT karaoke sweep — discrete per-word color change
-    - **Slightly smaller** font (2.8% vs 3.5%) for cleaner look
+    - **Bigger** font (3.6% portrait baseline) for high legibility
     - **Lower position** (25% from bottom by default) to avoid face occlusion
     - **Modern font**: Montserrat (falls back to Arial if unavailable)
     - **No temporal overlap** between subtitle groups
-
-    Args:
-        subtitle_margin_pct: Override margin percentage from bottom (for "lower" position).
-                            Defaults to 25% if not specified.
+    - **Black text** with white halo so it reads on bright footage
+    - **Portrait overflow guard**: extra word cap + larger horizontal margins
+      so text never runs off the narrow frame edges
     """
 
     hi_color = highlight_color or COLOR_HIGHLIGHT
@@ -127,7 +130,8 @@ def generate_ass_subtitles(
     effective_pct = _adapt_for_aspect_ratio(play_res_x, play_res_y, font_size_pct)
     font_size = _resolve_font_size(play_res_y, effective_pct)
     outline_w = _resolve_outline(play_res_y, effective_pct)
-    shadow_depth = max(1, outline_w // 2)
+    shadow_depth = max(2, outline_w)  # Larger soft white base for the glow
+    GLOW_BLUR = 3  # Edge blur → white halo / glow around the text
 
     # ── Alignment & margins ──────────────────────────────────────────────
     default_lower_margin = subtitle_margin_pct if subtitle_margin_pct is not None else 25.0
@@ -139,7 +143,10 @@ def generate_ass_subtitles(
     alignment_map = {"lower": 2, "center": 5, "upper": 8}
     alignment = alignment_map.get(position, 2)
     margin_v = round(play_res_y * margin_pct.get(position, 5.0) / 100.0)
-    margin_h = round(play_res_x * 8.0 / 100.0)
+    # Wider horizontal margin on portrait frames so text never runs off
+    # the narrow edges. 10% each side on portrait, 8% otherwise.
+    margin_h_pct = 10.0 if (play_res_x / max(1, play_res_y)) < 1.0 else 8.0
+    margin_h = round(play_res_x * margin_h_pct / 100.0)
 
     # ── ASS header with two styles ───────────────────────────────────────
     # Style "Word": normal white word
@@ -159,12 +166,12 @@ def generate_ass_subtitles(
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         # Normal word style (white)
         f"Style: Word,{font_name},{font_size},"
-        f"{nm_color},{nm_color},{COLOR_OUTLINE},{COLOR_SHADOW},"
+        f"{nm_color},{nm_color},{COLOR_OUTLINE},{COLOR_GLOW},"
         f"-1,0,0,0,100,100,1.0,0,1,{outline_w},{shadow_depth},"
         f"{alignment},{margin_h},{margin_h},{margin_v},1\n"
         # Highlighted word style (yellow) — same positioning
         f"Style: WordHi,{font_name},{font_size},"
-        f"{hi_color},{hi_color},{COLOR_OUTLINE},{COLOR_SHADOW},"
+        f"{hi_color},{hi_color},{COLOR_OUTLINE},{COLOR_GLOW},"
         f"-1,0,0,0,100,100,1.0,0,1,{outline_w},{shadow_depth},"
         f"{alignment},{margin_h},{margin_h},{margin_v},1\n"
         "\n"
@@ -174,7 +181,11 @@ def generate_ass_subtitles(
     )
 
     # ── Group words into single-line chunks ──────────────────────────────
-    groups = _group_words(words, max_words=max_words_per_group)
+    # Tighter cap on portrait frames: the bigger font means fewer words fit
+    # on the narrow width before the line would overflow the edges.
+    is_portrait = (play_res_x / max(1, play_res_y)) < 1.0
+    cap = 3 if is_portrait else max_words_per_group
+    groups = _group_words(words, max_words=cap)
     if not groups:
         return header
 
@@ -243,7 +254,7 @@ def generate_ass_subtitles(
                     parts.append(wt)
 
             text = " ".join(parts)
-            line = f"Dialogue: 0,{start_str},{end_str},Word,,0,0,0,,{text}"
+            line = f"Dialogue: 0,{start_str},{end_str},Word,,0,0,0,,{{\\blur{GLOW_BLUR}}}{text}"
             dialogue_lines.append(line)
 
     return header + "\n".join(dialogue_lines) + "\n"
@@ -266,15 +277,16 @@ def generate_title_overlay(
     """
     aspect = play_res_x / play_res_y
     if aspect < 1.0:
-        font_size = int(play_res_x * 0.07)
+        # Portrait: make the title big and bold
+        font_size = int(play_res_x * 0.085)
     else:
-        font_size = int(play_res_y * 0.08)
+        font_size = int(play_res_y * 0.10)
 
     outline_w = max(4, int(font_size * 0.15))  # Thicker outline for rounded effect
     shadow_d = max(3, int(font_size * 0.12))   # Larger shadow for soft rounded corners
 
-    # Colors
-    c_text = _rgb_to_ass(255, 255, 255)
+    # Colors: black text on a yellow background pill
+    c_text = _rgb_to_ass(0, 0, 0)
     c_outline = _rgb_to_ass(0, 0, 0)
     c_shadow = _rgb_to_ass(0, 0, 0, 100)
 
@@ -292,7 +304,7 @@ def generate_title_overlay(
     margin_h = round(play_res_x * 5.0 / 100.0)
 
     # Background box style (BorderStyle=3 creates a box behind text)
-    bg_color = _rgb_to_ass(0, 0, 0, 160)  # semi-transparent black
+    bg_color = _rgb_to_ass(255, 225, 53, 235)  # opaque-ish yellow
 
     header = (
         "[Script Info]\n"

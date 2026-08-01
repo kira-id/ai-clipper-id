@@ -1,5 +1,11 @@
 """
 LLM prompts for clip processing: translation, caption fixing, and deduplication.
+
+Translation targets are templated with ``{TARGET_LANGUAGE}`` (a human-readable
+language label such as "English" or "Indonesian"). We deliberately use string
+``.replace()`` rather than ``str.format()`` to fill that token, because several
+prompts contain raw JSON ``{...}`` braces that would otherwise be misinterpreted
+by ``str.format()``.
 """
 
 PROMPTS = {
@@ -21,6 +27,12 @@ Language: All fields in English except comment_bait (Indonesian). Translate if n
 Return ONLY valid JSON array (one item), no other text.""",
 
     "Translate to English": """For each clip, translate reason, topic, caption, hook, closing_line to English if not already. Preserve meaning, tone, and marketing appeal.
+
+Do NOT translate "title" or "comment_bait"—keep as-is. Keep all other fields unchanged.
+
+Return ONLY valid JSON array, no other text.""",
+
+    "Translate to Target Language": """For each clip, translate reason, topic, caption, hook, closing_line to {TARGET_LANGUAGE} if not already in that language. Preserve meaning, tone, and marketing appeal.
 
 Do NOT translate "title" or "comment_bait"—keep as-is. Keep all other fields unchanged.
 
@@ -71,6 +83,37 @@ Rules:
 
 Return ONLY valid JSON array.""",
 
+    "Translate Subtitle Phrases to Target Language": """Translate each subtitle's "text" to {TARGET_LANGUAGE} (keep unchanged if already in that language) and add natural punctuation.
+
+Input: [{"id": 0, "text": "...", "start": 0.5, "end": 2.0}, ...]
+
+Rules:
+- Translate "text" only. Keep id/start/end unchanged
+- Add periods, commas, question/exclamation marks naturally (use {TARGET_LANGUAGE} punctuation conventions)
+- Don't add or remove words—punctuation only
+- Same item count in output
+
+Return ONLY valid JSON array.""",
+
+    "Translate and Fix Subtitle Phrases": """Fix Whisper transcription errors, translate to {TARGET_LANGUAGE}, and add punctuation.
+
+Common Whisper errors: wrong words from similar sounds, missing punctuation, botched proper nouns/brands, run-on sentences, misheard words.
+
+Input: [{"id": 0, "text": "...", "start": 0.5, "end": 2.0}, ...]
+
+Tasks:
+1. Fix transcription errors using context
+2. Translate to {TARGET_LANGUAGE} (if needed)
+3. Add natural punctuation (use {TARGET_LANGUAGE} punctuation conventions)
+
+Rules:
+- Keep id/start/end unchanged, same item count
+- Roughly same word count—don't add/remove concepts
+- Fix proper nouns, brands, technical terms
+- Keep conversational tone
+
+Return ONLY valid JSON array.""",
+
     "Fix and Translate Subtitle Phrases": """Fix Whisper transcription errors, translate to English, and add punctuation.
 
 Common Whisper errors: wrong words from similar sounds, missing punctuation, botched proper nouns/brands, run-on sentences, misheard words.
@@ -89,27 +132,50 @@ Rules:
 - Keep conversational tone
 
 Return ONLY valid JSON array.""",
+
+    "Fix Subtitle Phrases (No Translate)": """Fix Whisper transcription errors in each subtitle's "text" and add natural punctuation. Do NOT translate the language.
+
+Common Whisper errors: wrong words from similar sounds, missing punctuation, botched proper nouns/brands, run-on sentences, misheard words.
+
+Input: [{"id": 0, "text": "...", "start": 0.5, "end": 2.0}, ...]
+
+Tasks:
+1. Fix transcription errors using context
+2. Add natural punctuation
+
+Rules:
+- Keep id/start/end unchanged, same item count
+- Roughly same word count—don't add/remove concepts
+- Fix proper nouns, brands, technical terms
+- Keep conversational tone
+- Preserve the original language of "text"
+
+Return ONLY valid JSON array.""",
 }
 
 
-def get_prompt(section_name: str) -> str:
-    """
-    Get a prompt by section name.
+def render_prompt(section_name: str, target_language: str = "English") -> str:
+    """Get a prompt, filling the ``{TARGET_LANGUAGE}`` token if present.
 
-    Args:
-        section_name: One of:
-            - "Generate Single Clip Metadata"
-            - "Translate to English"
-            - "Fix Mismatched Caption/Topic"
-            - "Improve and Deduplicate Clips"
-            - "Translate Subtitle Phrases"
-            - "Fix and Translate Subtitle Phrases"
-
-    Returns:
-        The prompt text, or empty string if not found
+    Uses ``str.replace`` (not ``str.format``) so existing JSON ``{...}`` braces
+    in prompts are left untouched.
     """
     prompt = PROMPTS.get(section_name, "")
     if not prompt:
         from ..utils import log
         log("WARN", f"Prompt '{section_name}' not found. Available: {list(PROMPTS.keys())}")
-    return prompt
+        return ""
+    return prompt.replace("{TARGET_LANGUAGE}", target_language)
+
+
+def get_prompt(section_name: str) -> str:
+    """
+    Get a prompt by section name (legacy, un-parameterized lookup).
+
+    Args:
+        section_name: One of the keys in PROMPTS.
+
+    Returns:
+        The prompt text, or empty string if not found.
+    """
+    return render_prompt(section_name)

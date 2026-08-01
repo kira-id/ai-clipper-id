@@ -1,60 +1,6 @@
 # AI Clipper Configuration
 # Copy this file to config.yaml and customize your settings
 
-# ── Background Music Library ──────────────────────────────────────────────
-# Define your music library with mood categories.
-# The LLM will match clips to music based on these descriptions.
-# Place the actual .mp3 files in the music_dir specified below.
-
-music_library:
-  - id: upbeat_pop
-    category: upbeat
-    mood: "energetic, happy, motivational, fun"
-    description: "Upbeat pop/electronic beat — great for tips, tutorials, success stories"
-    file: upbeat_pop.mp3
-
-  - id: chill_lofi
-    category: chill
-    mood: "relaxed, calm, thoughtful, cozy"
-    description: "Lo-fi hip hop chill beat — perfect for storytelling, explanations, reflections"
-    file: chill_lofi.mp3
-
-  - id: dramatic_cinematic
-    category: dramatic
-    mood: "intense, serious, suspenseful, emotional"
-    description: "Cinematic orchestral — for shocking reveals, serious topics, emotional moments"
-    file: dramatic_cinematic.mp3
-
-  - id: inspiring_ambient
-    category: inspiring
-    mood: "hopeful, uplifting, inspirational, warm"
-    description: "Ambient inspirational — for motivational content, success stories, advice"
-    file: inspiring_ambient.mp3
-
-  - id: tech_electronic
-    category: tech
-    mood: "futuristic, modern, innovative, fast"
-    description: "Electronic/tech beat — for tech topics, innovation, how-tos, demonstrations"
-    file: tech_electronic.mp3
-
-  - id: funny_quirky
-    category: funny
-    mood: "comedic, playful, silly, lighthearted"
-    description: "Quirky comedic — for funny moments, memes, roasts, lighthearted content"
-    file: funny_quirky.mp3
-
-  - id: sad_piano
-    category: emotional
-    mood: "sad, melancholic, touching, sentimental"
-    description: "Soft piano — for emotional stories, heartfelt moments, personal sharing"
-    file: sad_piano.mp3
-
-  - id: hype_trap
-    category: hype
-    mood: "aggressive, confident, bold, powerful"
-    description: "Trap/bass beat — for bold claims, confrontational takes, confidence, hype"
-    file: hype_trap.mp3
-
 # ── Default CLI Parameters ────────────────────────────────────────────────
 # These values are used as defaults when running the CLI.
 # You can still override them via command-line arguments.
@@ -89,6 +35,7 @@ defaults:
   # LLM chunking settings
   chunk_duration: 360.0  # seconds
   chunk_overlap: 60.0    # seconds
+  llm_parallel: false    # run LLM chunk + per-clip subtitle calls concurrently (faster; needs a model without tight rate limits)
 
   # Output directory (relative to project root)
   output_dir: clips
@@ -102,11 +49,6 @@ defaults:
 
   # Person detection crop is automatic when orientation conversion is needed.
   # Use --no-crop to disable.
-
-  # Background music
-  music_enabled: false
-  music_dir: music
-  music_volume: 0.20  # 0.0-1.0 (20% volume by default)
 
   # Silence removal
   silence_removal_enabled: true
@@ -137,16 +79,9 @@ cta:
   duration: 3.0                   # Duration of the CTA screen in seconds
   fade_duration: 0.5              # Cross-fade length from clip to CTA (seconds)
 
-# ── Pixabay Music Download Settings ───────────────────────────────────────
-# Used when auto-downloading music library
-
-pixabay:
-  min_duration: 30  # Minimum track duration in seconds
-  per_page: 5       # Number of results per search
-
 # ── OpenRouter LLM Settings ──────────────────────────────────────────────
 # Model used for clip analysis and content generation
 
 openrouter:
-  model: arcee-ai/trinity-large-preview:free
+  model: openrouter/free
   base_url: https://openrouter.ai/api/v1

@@ -56,33 +56,72 @@ def generate_single_clip_metadata(
     return updated
 
 
+def _normalize_target_language(target_language: str | None) -> str:
+    """Normalize the user-facing target-language option into a canonical key.
+
+    Returns one of: "auto", "en", "id", or any open language code/label.
+    "auto" means "keep the detected/transcribed language" (no translation).
+    """
+    if not target_language:
+        return "en"
+    t = str(target_language).strip().lower()
+    if t in ("", "none", "auto", "source", "keep", "keep-original",
+             "keep_original", "original"):
+        return "auto"
+    return t
+
+
+def _target_label(target_language: str) -> str:
+    """Human-readable language label for prompts.
+
+    "auto" -> "the same language as the transcript" (caller should avoid this
+    path; we only translate when target is an explicit language).
+    """
+    t = str(target_language).strip()
+    if t.lower() in ("en", "english"):
+        return "English"
+    if t.lower() in ("id", "indonesian", "bahasa", "bahasa indonesia"):
+        return "Indonesian"
+    return t  # open language: used verbatim in the prompt
+
+
 def fix_and_improve_clips(
     clips: list[dict[str, Any]],
     llm_model: str | None = None,
     api_key: str | None = None,
     detected_language: dict[str, Any] | None = None,
+    target_language: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Post-process clips to:
-    1. Translate to English if needed
+    1. Translate to the target language if needed (default English; "auto" keeps the
+       original/transcribed language, which only fixes caption/topic & improves)
     2. Fix mismatched caption/topic pairs
-    3. Improve titles/hooks/captions and deduplicate similar topics
+    3. Improve titles/hooks/captions and deduplicate topics
 
     This runs AFTER find_clips() and BEFORE subtitle generation.
-    
+
     Args:
         detected_language: dict with keys "language" and "language_probability" from Whisper
+        target_language: "en" (default), "id", "auto" (keep original), or any open
+            language label/code. Controls which language clip metadata is translated into.
     """
     if not clips:
         log("WARN", "No clips to fix")
         return clips
 
-    log("INFO", f"Starting clip fixing pipeline: {len(clips)} clips")
+    target = _normalize_target_language(target_language)
+    log("INFO", f"Starting clip fixing pipeline: {len(clips)} clips "
+                f"(target language: {target})")
 
-    # Step 1: Translate to English (skip if already English)
-    log("INFO", "Step 1/3: Translating to English...")
-    clips = _translate_to_english(clips, llm_model, api_key, detected_language)
-    log("OK", f"After translation: {len(clips)} clips")
+    # Step 1: Translate to target language (skip entirely when "auto")
+    if target == "auto":
+        log("INFO", "Step 1/3: Keeping original language (auto) — skipping translation")
+    else:
+        label = _target_label(target)
+        log("INFO", f"Step 1/3: Translating to {label}...")
+        clips = _translate_to_language(clips, label, llm_model, api_key, detected_language)
+        log("OK", f"After translation: {len(clips)} clips")
 
     # Step 2: Fix mismatched caption/topic
     log("INFO", "Step 2/3: Fixing mismatched caption/topic pairs...")
@@ -102,37 +141,53 @@ def fix_and_improve_clips(
     return clips
 
 
-def _translate_to_english(
+def _translate_to_language(
     clips: list[dict[str, Any]],
+    target_label: str,
     llm_model: str | None = None,
     api_key: str | None = None,
     detected_language: dict[str, Any] | None = None,
     max_retries: int = 2,
 ) -> list[dict[str, Any]]:
     """
-    Translate title, topic, caption, hook to English if not already English.
-    Skips translation if Whisper detected English with >60% confidence.
+    Translate title, topic, caption, hook, reason to ``target_label`` if not already.
+
+    Defaults to English for backward compatibility. Skips translation when the
+    source was detected as the target language with >60% confidence (so an
+    English-video -> English target does not waste an LLM call).
+
+    Args:
+        target_label: human-readable language name passed to the LLM
+            (e.g. "English", "Indonesian", or any open language).
     """
     if not clips:
         return clips
 
-    # Skip translation if already English (based on Whisper detection)
-    if detected_language:
+    # Skip translation if Whisper already detected the *target* language with
+    # high confidence (primarily relevant for English target with an English source).
+    if detected_language and target_label.lower().startswith("en"):
         lang = detected_language.get("language", "").lower()
         prob = detected_language.get("language_probability", 0.0)
         if lang == "en" and prob > 0.6:
             log("OK", f"Language detected as English (p={prob:.0%}), skipping translation")
             return clips
 
-    # Read the translation prompt from docs/prompts.md
-    prompt_text = _read_prompt("Translate to English")
+    # Choose the right prompt: English target keeps the original wording,
+    # any other target uses the parameterized prompt.
+    if target_label.lower().startswith("en"):
+        prompt_text = _read_prompt("Translate to English")
+    else:
+        prompt_text = _read_prompt("Translate to Target Language", target_label)
 
     # Prepare user message with clips
     clips_json = json.dumps(clips, ensure_ascii=False, indent=2)
     user_message = f"{prompt_text}\n\nClips to translate:\n{clips_json}"
 
     # Call LLM with retry
-    system_message = "You are a helpful assistant that translates content to English while preserving meaning and tone."
+    system_message = (
+        f"You are a helpful assistant that translates content to {target_label} "
+        f"while preserving meaning and tone."
+    )
     result = None
     for attempt in range(max_retries + 1):
         try:
@@ -292,9 +347,12 @@ def translate_subtitle_words(
     api_key: str | None = None,
     max_words_per_group: int = 5,
     fix_errors: bool = True,
+    target_language: str | None = None,
+    phrases: list[dict] | None = None,
 ) -> list[dict]:
     """
-    Translate word-level subtitle entries to English, optionally fixing transcription errors.
+    Translate word-level subtitle entries to the target language, optionally
+    fixing transcription errors.
 
     Groups ``words`` into short phrases, asks the LLM to translate (and optionally fix) each
     phrase, then redistributes the original timestamps proportionally
@@ -309,47 +367,91 @@ def translate_subtitle_words(
         max_words_per_group: Max source words per subtitle phrase group.
         fix_errors: If True, use LLM to fix Whisper transcription errors + translate.
                    If False, only translate existing text.
+        target_language: "en" (default), "id", "auto" (keep original, fix only),
+                   or any open language label/code. Controls the subtitle language.
+        phrases: Optional pre-built phrase list ``[{"id", "text", "start", "end"}]``.
+                 When supplied (e.g. by a caller merging multiple clips), the
+                 grouping step is skipped so all phrases are translated in ONE
+                 LLM call. The ``id`` values are trusted as the redistribution key.
 
     Returns:
         Translated word list with the same ``{"word", "start", "end"}`` shape.
     """
-    if not words:
+    if not words and not phrases:
         return []
 
+    target = _normalize_target_language(target_language)
+    # "auto" => keep the transcribed language: fix errors but do not translate.
+    keep_original = target == "auto"
+    label = "English" if target == "en" else _target_label(target)
+
     # ── 1. Group words into short phrases ──────────────────────────────────
-    groups: list[list[dict]] = []
-    current: list[dict] = []
-    for w in words:
-        current.append(w)
-        if len(current) >= max_words_per_group:
+    # Allow callers (web_runner, cli) to pass a pre-built/merged phrase list so
+    # multiple clips can be translated in ONE LLM call (big speedup). When the
+    # caller supplies `phrases`, we trust it and skip regrouping.
+    if phrases:
+        groups = []
+        for p in phrases:
+            # Reconstruct groups from caller-supplied phrases for downstream
+            # timestamp redistribution. Preserve the real phrase id so the
+            # id→translated_text map (keyed on id) lines up after the LLM call.
+            groups.append([
+                {
+                    "id": p.get("id"),
+                    "word": p.get("text", ""),
+                    "start": p["start"],
+                    "end": p["end"],
+                }
+            ])
+        # `phrases` is already the final list; keep it as-is below.
+    else:
+        groups: list[list[dict]] = []
+        current: list[dict] = []
+        for w in words:
+            current.append(w)
+            if len(current) >= max_words_per_group:
+                groups.append(current)
+                current = []
+        if current:
             groups.append(current)
-            current = []
-    if current:
-        groups.append(current)
 
-    # ── 2. Build phrase list for LLM ────────────────────────────────────────
-    phrases = [
-        {
-            "id": i,
-            "text": " ".join(w["word"] for w in grp),
-            "start": grp[0]["start"],
-            "end": grp[-1]["end"],
-        }
-        for i, grp in enumerate(groups)
-    ]
+        # ── 2. Build phrase list for LLM ────────────────────────────────────────
+        phrases = [
+            {
+                "id": i,
+                "text": " ".join(w["word"] for w in grp),
+                "start": grp[0]["start"],
+                "end": grp[-1]["end"],
+            }
+            for i, grp in enumerate(groups)
+        ]
 
-    # Choose prompt based on whether we're fixing errors or just translating
-    if fix_errors:
-        prompt_text = _read_prompt("Fix and Translate Subtitle Phrases")
+    # Choose prompt based on whether we're fixing errors, translating, or both
+    if keep_original:
+        # Keep original language: only fix Whisper errors + punctuation
+        prompt_text = _read_prompt("Fix Subtitle Phrases (No Translate)")
         system_message = (
-            "You are a professional subtitle translator and transcription editor. "
-            "Fix Whisper transcription errors and translate spoken content to natural English."
+            "You are a professional subtitle transcription editor. "
+            "Fix Whisper transcription errors and add natural punctuation, "
+            "but preserve the original language."
+        )
+    elif fix_errors:
+        if label.lower().startswith("en"):
+            prompt_text = _read_prompt("Fix and Translate Subtitle Phrases")
+        else:
+            prompt_text = _read_prompt("Translate and Fix Subtitle Phrases", label)
+        system_message = (
+            f"You are a professional subtitle translator and transcription editor. "
+            f"Fix Whisper transcription errors and translate spoken content to natural {label}."
         )
     else:
-        prompt_text = _read_prompt("Translate Subtitle Phrases")
+        if label.lower().startswith("en"):
+            prompt_text = _read_prompt("Translate Subtitle Phrases")
+        else:
+            prompt_text = _read_prompt("Translate Subtitle Phrases to Target Language", label)
         system_message = (
-            "You are a professional subtitle translator. "
-            "Translate spoken content to natural English accurately."
+            f"You are a professional subtitle translator. "
+            f"Translate spoken content to natural {label} accurately."
         )
 
     phrases_json = json.dumps(phrases, ensure_ascii=False, indent=2)
@@ -380,18 +482,28 @@ def translate_subtitle_words(
         pid = item.get("id")
         text = item.get("text", "").strip()
         if pid is not None and text:
+            # Guardrail: free-tier models occasionally return <unk> garbage or
+            # near-empty strings. Rejecting them here falls through to the
+            # per-phrase "keep original" fallback instead of burning the clip
+            # with nonsense subtitles (and wasting ~10 min regenerating).
+            unk_ratio = text.count("<unk>") / max(1, len(text.split()))
+            if unk_ratio > 0.2 or len(text) < 2:
+                log("WARN", f"Subtitle phrase id={pid} returned degenerate output "
+                             f"(unk_ratio={unk_ratio:.2f}); keeping original words")
+                continue
             id_to_text[int(pid)] = text
 
     # ── 3. Redistribute timestamps for translated words ──────────────────────
     translated_words: list[dict] = []
-    for i, grp in enumerate(groups):
+    for grp in groups:
+        pid = grp[0].get("id")
         phrase_start = grp[0]["start"]
         phrase_end = grp[-1]["end"]
         phrase_duration = phrase_end - phrase_start
 
-        translated_text = id_to_text.get(i)
+        translated_text = id_to_text.get(pid) if pid is not None else None
         if not translated_text:
-            log("WARN", f"Subtitle translation missing for phrase id={i}, keeping original")
+            log("WARN", f"Subtitle translation missing for phrase id={pid}, keeping original")
             # Fallback: keep original words for this phrase
             for w in grp:
                 translated_words.append(w.copy())
@@ -410,21 +522,138 @@ def translate_subtitle_words(
                 "word": tw,
                 "start": phrase_start + j * word_dur,
                 "end": phrase_start + (j + 1) * word_dur,
+                "_pid": pid,  # transient: marks source phrase for batch remap
             })
 
     log("OK", f"Subtitle {'fix+translation' if fix_errors else 'translation'}: {len(words)} original words → {len(translated_words)} translated words")
+    # Strip the transient _pid tag (used only for batch remapping) so direct
+    # callers (single_video_runner, process_single) don't emit it into ASS.
+    for w in translated_words:
+        w.pop("_pid", None)
     return translated_words
 
 
-def _read_prompt(section_name: str) -> str:
+def batch_translate_subtitles(
+    clips: list[dict[str, Any]],
+    segments: list[dict[str, Any]],
+    llm_model: str | None = None,
+    api_key: str | None = None,
+    fix_errors: bool = True,
+    target_language: str | None = None,
+    max_words_per_group: int = 5,
+) -> dict[int, list[dict]]:
+    """
+    Translate subtitle words for ALL clips in a single merged LLM call.
+
+    Replaces the previous one-``translate_subtitle_words``-call-per-clip loop
+    (N round-trips — the dominant cost on long videos, ~25 min in the run
+    logs). Every clip's raw words are gathered, each phrase gets a globally
+    unique id, and they are all translated at once. The returned flat word
+    list carries a transient ``_pid`` per word; we remap by pid→clip and strip
+    the tag.
+
+    Returns a dict mapping ``clip['rank'] -> translated word list``
+    (``[]`` for clips with no words). On total failure every clip falls back
+    to its original raw words rather than emitting garbage.
+    """
+    from .subtitles import get_clip_words
+
+    if not clips:
+        return {}
+
+    target = _normalize_target_language(target_language)
+
+    merged_phrases: list[dict] = []
+    clip_phrase_ids: dict[int, list[int]] = {}
+    for clip in clips:
+        rank = int(clip.get("rank", 0))
+        clip_phrase_ids[rank] = []
+        raw_words = get_clip_words(
+            segments, clip_start=clip["start"], clip_end=clip["end"]
+        )
+        if not raw_words:
+            continue
+        current: list[dict] = []
+        for w in raw_words:
+            current.append(w)
+            if len(current) >= max_words_per_group:
+                pid = len(merged_phrases)
+                merged_phrases.append({
+                    "id": pid,
+                    "text": " ".join(x["word"] for x in current),
+                    "start": current[0]["start"],
+                    "end": current[-1]["end"],
+                })
+                clip_phrase_ids[rank].append(pid)
+                current = []
+        if current:
+            pid = len(merged_phrases)
+            merged_phrases.append({
+                "id": pid,
+                "text": " ".join(x["word"] for x in current),
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
+            })
+            clip_phrase_ids[rank].append(pid)
+
+    if not merged_phrases:
+        return {int(c.get("rank", 0)): [] for c in clips}
+
+    log("INFO", f"Batch-translating subtitles for {len(clips)} clips "
+                f"({len(merged_phrases)} phrases) in ONE LLM call")
+
+    translated = translate_subtitle_words(
+        [],  # words unused when phrases supplied
+        llm_model=llm_model,
+        api_key=api_key,
+        fix_errors=fix_errors,
+        target_language=target_language,
+        phrases=merged_phrases,
+    )
+
+    # Group translated words by their source phrase id.
+    words_by_pid: dict[int, list[dict]] = {}
+    for w in translated:
+        pid = w.pop("_pid", None)  # strip transient tag
+        if pid is not None:
+            words_by_pid.setdefault(pid, []).append(w)
+
+    # Fallback: if the whole batch produced nothing, keep original raw words.
+    if not words_by_pid:
+        log("WARN", "Batch subtitle translation returned nothing; "
+                    "falling back to original words for all clips")
+        out: dict[int, list[dict]] = {}
+        for clip in clips:
+            rank = int(clip.get("rank", 0))
+            out[rank] = get_clip_words(
+                segments, clip_start=clip["start"], clip_end=clip["end"]
+            )
+        return out
+
+    result: dict[int, list[dict]] = {}
+    for clip in clips:
+        rank = int(clip.get("rank", 0))
+        clip_words: list[dict] = []
+        for pid in clip_phrase_ids.get(rank, []):
+            clip_words.extend(words_by_pid.get(pid, []))
+        result[rank] = clip_words
+    return result
+
+
+def _read_prompt(section_name: str, target_language: str = "English") -> str:
     """
     Get a prompt from prompts.py.
-    section_name: one of "Translate to English", "Fix Mismatched Caption/Topic", "Improve and Deduplicate Clips"
+
+    section_name: one of "Translate to English", "Translate to Target Language",
+        "Fix Mismatched Caption/Topic", "Improve and Deduplicate Clips",
+        "Translate Subtitle Phrases", "Translate Subtitle Phrases to Target Language",
+        "Translate and Fix Subtitle Phrases", "Fix and Translate Subtitle Phrases",
+        "Fix Subtitle Phrases (No Translate)".
+    target_language: human-readable label used to fill the ``{TARGET_LANGUAGE}``
+        token in parameterized prompts (default "English").
     """
-    prompt = get_prompt(section_name)
-    if not prompt:
-        raise RuntimeError(f"Prompt section '{section_name}' not found in prompts.py")
-    return prompt
+    from .prompts import render_prompt
+    return render_prompt(section_name, target_language)
 
 
 def _build_transcript_for_metadata(segments: list[dict[str, Any]]) -> str:
