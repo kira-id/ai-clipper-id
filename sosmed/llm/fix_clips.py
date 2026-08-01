@@ -349,6 +349,7 @@ def translate_subtitle_words(
     fix_errors: bool = True,
     target_language: str | None = None,
     phrases: list[dict] | None = None,
+    return_pid: bool = False,
 ) -> list[dict]:
     """
     Translate word-level subtitle entries to the target language, optionally
@@ -373,9 +374,15 @@ def translate_subtitle_words(
                  When supplied (e.g. by a caller merging multiple clips), the
                  grouping step is skipped so all phrases are translated in ONE
                  LLM call. The ``id`` values are trusted as the redistribution key.
+        return_pid: If True, keep the transient ``_pid`` (source phrase id) tag on
+                    each returned word. Used by ``batch_translate_subtitles`` to
+                    remap translated words back to their clips. Direct callers
+                    (single_video_runner, process_single) must leave this False so
+                    the tag is stripped before ASS rendering.
 
     Returns:
         Translated word list with the same ``{"word", "start", "end"}`` shape.
+        When ``return_pid`` is True, each word additionally carries ``_pid``.
     """
     if not words and not phrases:
         return []
@@ -454,49 +461,75 @@ def translate_subtitle_words(
             f"Translate spoken content to natural {label} accurately."
         )
 
-    phrases_json = json.dumps(phrases, ensure_ascii=False, indent=2)
-    user_message = f"{prompt_text}\n\nPhrases to translate:\n{phrases_json}"
+    # ── 2b. Call the LLM in chunks ──────────────────────────────────────────
+    # A single merged call for long videos emits 600+ phrase objects; the
+    # model's JSON output then hits the ``max_tokens`` ceiling and the tail
+    # phrases (highest ids) get truncated — they silently fell through to
+    # "keep original", shipping mixed-language subtitles (see the per-phrase
+    # warning below). Capping phrases-per-call keeps each response well under
+    # the 8192 output-token ceiling used in backends.openrouter (~35 tokens per
+    # phrase worst case → 200 leaves ample headroom). The per-phrase ``id`` is
+    # preserved across chunks so the redistribution map below still lines up.
+    MAX_PHRASES_PER_CALL = 200
 
-    # Call LLM with retry
-    max_retries = 2
-    result = None
-    for attempt in range(max_retries + 1):
-        try:
-            raw_result = call_llm(system_message, user_message, api_key, llm_model)
-            if raw_result and isinstance(raw_result, list) and all(isinstance(p, dict) for p in raw_result):
-                result = raw_result
-                break
-            else:
-                log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1}: malformed response, retrying...")
-        except Exception as e:
-            log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1}: {e}, retrying...")
-
-    # Graceful fallback: if all retries failed, return original words unchanged
-    if not result:
-        log("WARN", "Subtitle translation failed after retries, keeping original words unchanged")
-        return words
-
-    # Build id→translated_text map
     id_to_text: dict[int, str] = {}
-    for item in result:
-        pid = item.get("id")
-        text = item.get("text", "").strip()
-        if pid is not None and text:
-            # Guardrail: free-tier models occasionally return <unk> garbage or
-            # near-empty strings. Rejecting them here falls through to the
-            # per-phrase "keep original" fallback instead of burning the clip
-            # with nonsense subtitles (and wasting ~10 min regenerating).
-            unk_ratio = text.count("<unk>") / max(1, len(text.split()))
-            if unk_ratio > 0.2 or len(text) < 2:
-                log("WARN", f"Subtitle phrase id={pid} returned degenerate output "
-                             f"(unk_ratio={unk_ratio:.2f}); keeping original words")
-                continue
-            id_to_text[int(pid)] = text
+    n_chunks = (len(phrases) + MAX_PHRASES_PER_CALL - 1) // MAX_PHRASES_PER_CALL
+    for c_start in range(0, len(phrases), MAX_PHRASES_PER_CALL):
+        chunk = phrases[c_start:c_start + MAX_PHRASES_PER_CALL]
+        chunk_idx = c_start // MAX_PHRASES_PER_CALL + 1
+
+        phrases_json = json.dumps(chunk, ensure_ascii=False, indent=2)
+        user_message = f"{prompt_text}\n\nPhrases to translate:\n{phrases_json}"
+
+        # Call LLM with retry (per chunk)
+        max_retries = 2
+        result = None
+        for attempt in range(max_retries + 1):
+            try:
+                raw_result = call_llm(system_message, user_message, api_key, llm_model)
+                if raw_result and isinstance(raw_result, list) and all(isinstance(p, dict) for p in raw_result):
+                    result = raw_result
+                    break
+                else:
+                    log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1} "
+                                 f"(chunk {chunk_idx}/{n_chunks}): malformed response, retrying...")
+            except Exception as e:
+                log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1} "
+                             f"(chunk {chunk_idx}/{n_chunks}): {e}, retrying...")
+
+        if not result:
+            # Chunk failed entirely. Leave its phrases unmapped so they fall
+            # through to the per-phrase "keep original" path and get logged —
+            # better than dropping them silently, per project no-fallback rule.
+            log("WARN", f"Subtitle translation chunk {chunk_idx}/{n_chunks} failed after "
+                        f"retries; {len(chunk)} phrases will keep original text")
+            continue
+
+        # Merge this chunk's id→translated_text into the global map
+        for item in result:
+            pid = item.get("id")
+            text = item.get("text", "").strip()
+            if pid is not None and text:
+                # Guardrail: free-tier models occasionally return <unk> garbage or
+                # near-empty strings. Rejecting them here falls through to the
+                # per-phrase "keep original" fallback instead of burning the clip
+                # with nonsense subtitles (and wasting ~10 min regenerating).
+                unk_ratio = text.count("<unk>") / max(1, len(text.split()))
+                if unk_ratio > 0.2 or len(text) < 2:
+                    log("WARN", f"Subtitle phrase id={pid} returned degenerate output "
+                                 f"(unk_ratio={unk_ratio:.2f}); keeping original words")
+                    continue
+                id_to_text[int(pid)] = text
 
     # ── 3. Redistribute timestamps for translated words ──────────────────────
     translated_words: list[dict] = []
-    for grp in groups:
-        pid = grp[0].get("id")
+    for i, grp in enumerate(groups):
+        # Read the phrase id from the parallel `phrases` list (aligned by
+        # index), NOT from the group's first word. Word dicts in the single-
+        # clip path carry no "id", so grp[0].get("id") would be None and every
+        # phrase would fall through to the "keep original" fallback, silently
+        # discarding the translation.
+        pid = phrases[i].get("id")
         phrase_start = grp[0]["start"]
         phrase_end = grp[-1]["end"]
         phrase_duration = phrase_end - phrase_start
@@ -528,8 +561,11 @@ def translate_subtitle_words(
     log("OK", f"Subtitle {'fix+translation' if fix_errors else 'translation'}: {len(words)} original words → {len(translated_words)} translated words")
     # Strip the transient _pid tag (used only for batch remapping) so direct
     # callers (single_video_runner, process_single) don't emit it into ASS.
-    for w in translated_words:
-        w.pop("_pid", None)
+    # When return_pid is True (batch mode) we keep it so the caller can remap
+    # words back to their source clip, then strip it itself.
+    if not return_pid:
+        for w in translated_words:
+            w.pop("_pid", None)
     return translated_words
 
 
@@ -556,7 +592,7 @@ def batch_translate_subtitles(
     (``[]`` for clips with no words). On total failure every clip falls back
     to its original raw words rather than emitting garbage.
     """
-    from .subtitles import get_clip_words
+    from ..subtitles import get_clip_words
 
     if not clips:
         return {}
@@ -600,7 +636,9 @@ def batch_translate_subtitles(
         return {int(c.get("rank", 0)): [] for c in clips}
 
     log("INFO", f"Batch-translating subtitles for {len(clips)} clips "
-                f"({len(merged_phrases)} phrases) in ONE LLM call")
+                f"({len(merged_phrases)} phrases)")
+    # NOTE: chunking is handled inside ``translate_subtitle_words`` so both the
+    # batch path (here) and the single-video path (direct caller) are covered.
 
     translated = translate_subtitle_words(
         [],  # words unused when phrases supplied
@@ -609,6 +647,7 @@ def batch_translate_subtitles(
         fix_errors=fix_errors,
         target_language=target_language,
         phrases=merged_phrases,
+        return_pid=True,  # keep _pid so we can remap words back to clips
     )
 
     # Group translated words by their source phrase id.

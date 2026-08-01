@@ -58,6 +58,27 @@
   .step .detail{font-size:12px;color:var(--dim);word-break:break-word}
   .step.active .name{color:var(--cyan)}
   @keyframes pulse{0%{box-shadow:0 0 0 4px rgba(57,208,255,.15)}50%{box-shadow:0 0 0 9px rgba(57,208,255,.04)}100%{box-shadow:0 0 0 4px rgba(57,208,255,.15)}}
+  /* step result collapsibles */
+  .step .reveal{margin-top:8px}
+  .step .rtoggle{display:inline-flex;align-items:center;gap:6px;font-size:11px;
+    color:var(--cyan);background:var(--panel2);border:1px solid var(--line);
+    border-radius:7px;padding:3px 9px;cursor:pointer;user-select:none}
+  .step .rtoggle:hover{border-color:var(--cyan)}
+  .step .rtoggle::before{content:"▸"}
+  .step .reveal.open .rtoggle::before{content:"▾"}
+  .step .rbody{display:none;margin-top:8px;background:#070a10;border:1px solid var(--line);
+    border-radius:10px;padding:10px 12px;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .step .reveal.open .rbody{display:block}
+  .step .rbody .kv{display:grid;grid-template-columns:auto 1fr;gap:2px 14px;margin-bottom:8px}
+  .step .rbody .kv .k{color:var(--dim)}
+  .step .rbody .kv .v{color:var(--txt);word-break:break-word}
+  .step .rbody .segs{margin:0;padding:0;list-style:none}
+  .step .rbody .segs li{padding:4px 0;border-top:1px solid var(--line);white-space:pre-wrap;word-break:break-word}
+  .step .rbody .segs li:first-child{border-top:0}
+  .step .rbody .ts{color:var(--cyan);margin-right:8px}
+  .step .rbody .pill{display:inline-block;font-size:10px;padding:1px 7px;border-radius:999px;
+    background:var(--panel2);border:1px solid var(--line);color:var(--cyan);margin:0 6px 4px 0}
+  .step .rbody .more{color:var(--dim);font-style:italic;margin-top:4px}
   .bar{height:8px;background:var(--panel2);border-radius:999px;overflow:hidden;margin:4px 0 2px}
   .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#39d0ff,#3ddc84);transition:width .4s}
   /* log */
@@ -386,6 +407,22 @@ function render(s){
     const d = el.querySelector('.detail');
     if(s.detail[k]) d.textContent = s.detail[k];
     else if(st==='pending') d.textContent='—';
+    // ensure a reveal container exists for collapsible step output
+    let reveal = el.querySelector('[data-r]');
+    if(!reveal){
+      reveal = document.createElement('div');
+      reveal.className = 'reveal';
+      reveal.dataset.r = '1';
+      el.querySelector('.meta').appendChild(reveal);
+    }
+    const res = (s.step_results||{})[k];
+    if(res){
+      reveal.innerHTML = renderStepResult(res);
+      bindToggle(reveal);
+    } else {
+      reveal.innerHTML = '';
+      reveal.classList.remove('open');
+    }
   });
   // cache badges + clear buttons
   const cache = s.cache || {};
@@ -437,7 +474,86 @@ function render(s){
 function showError(m){ const e=$('#err'); e.classList.remove('hidden'); e.textContent='⚠ '+m;
   if(currentJobId){ $('#retryBox').classList.remove('hidden'); } }
 function fmt(s){ return s==null?'':(Math.round(s*10)/10)+''; }
-function escapeHtml(x){ return (x||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+// ── collapsible step results ──
+function bindToggle(reveal){
+  const t = reveal.querySelector('.rtoggle');
+  if(!t || t.dataset.bound) return;
+  t.dataset.bound = '1';
+  t.addEventListener('click', ()=> reveal.classList.toggle('open'));
+}
+function fmtTs(x){
+  if(x==null) return '';
+  const n = Math.round(x*10)/10;
+  return (n%1===0? n+'.0' : ''+n);
+}
+// Build the inner HTML of a step's collapsible "show output" panel from an
+// intermediate-result payload produced by the backend.
+function renderStepResult(res){
+  let kv = '', body = '';
+  if(res.cached!==undefined)
+    kv += '<span class="k">source</span><span class="v">'+(res.cached?'cached result':'freshly computed')+'</span>';
+  if(res.note)
+    kv += '<span class="k">note</span><span class="v">'+escapeHtml(res.note)+'</span>';
+
+  if(res.preview){
+    const items = res.preview.map(p=>{
+      const ts = (p.start!=null&&p.end!=null)
+        ? '<span class="ts">'+fmtTs(p.start)+'–'+fmtTs(p.end)+'s</span>' : '';
+      const extra = p.label
+        ? '<span class="pill">'+escapeHtml(p.label)+'</span>' : '';
+      const extra2 = (p.intensity!=null)
+        ? '<span class="pill">intensity '+p.intensity+'</span>' : '';
+      const txt = escapeHtml(p.text != null ? p.text : (p.title != null ? p.title : ''));
+      return '<li>'+ts+extra+extra2+txt+'</li>';
+    }).join('');
+    body += '<ul class="segs">'+items+'</ul>';
+    if(res.count!=null && res.preview.length < res.count)
+      body += '<div class="more">…showing '+res.preview.length+' of '+res.count+'</div>';
+  }
+  if(res.clips){
+    const items = res.clips.map(c=>{
+      const ts = (c.start!=null&&c.end!=null)
+        ? '<span class="ts">'+fmtTs(c.start)+'–'+fmtTs(c.end)+'s</span>' : '';
+      const sc = (c.score!=null)
+        ? '<span class="pill">score '+c.score+'</span>' : '';
+      const ti = c.title? '<b>'+escapeHtml(c.title)+'</b> ' : '';
+      const top = c.topic? '<span class="pill">'+escapeHtml(c.topic)+'</span>' : '';
+      const cap = c.caption? '<div style="color:var(--dim)">'+escapeHtml(c.caption)+'</div>' : '';
+      return '<li>'+ts+sc+ti+top+cap+'</li>';
+    }).join('');
+    body += '<ul class="segs">'+items+'</ul>';
+    if(res.count!=null && res.clips.length < res.count)
+      body += '<div class="more">…showing '+res.clips.length+' of '+res.count+'</div>';
+  }
+  if(res.reasons){
+    const pills = Object.entries(res.reasons)
+      .map(([r,n])=>'<span class="pill">'+escapeHtml(r)+': '+n+'</span>').join('');
+    kv += '<span class="k">dropped by</span><span class="v">'+pills+'</span>';
+  }
+  if(res.labels){
+    const pills = Object.entries(res.labels)
+      .map(([l,n])=>'<span class="pill">'+escapeHtml(l)+': '+n+'</span>').join('');
+    kv += '<span class="k">event types</span><span class="v">'+pills+'</span>';
+  }
+  if(res.files){
+    const pills = res.files.map(f=>'<span class="pill">'+escapeHtml(f)+'</span>').join('');
+    body += '<div style="margin-top:8px">'+pills+'</div>';
+  }
+  const skip = new Set(['cached','note','preview','clips','reasons','labels','files','count']);
+  for(const [k,v] of Object.entries(res)){
+    if(skip.has(k) || v==null) continue;
+    if(typeof v==='object') continue;
+    kv += '<span class="k">'+escapeHtml(String(k))+'</span><span class="v">'+escapeHtml(String(v))+'</span>';
+  }
+
+  return '<div class="rtoggle">show output</div>'
+       + '<div class="rbody">'
+       + (kv? '<div class="kv">'+kv+'</div>' : '')
+       + body
+       + '</div>';
+}
+function escapeHtml(x){ return String(x==null?'':x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 // ── cache clear (explicit, user-initiated) ──
 async function clearCache(step){

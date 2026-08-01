@@ -31,7 +31,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "output_dir": "clips",
         "subtitles_enabled": True,
         "subtitle_position": "lower",
-        "subtitle_margin_pct": 25.0,  # 25% from bottom for "lower" position
+        "subtitle_margin_pct": 10.0,  # 10% from bottom for "lower" position (lower on screen)
         "silence_removal_enabled": True,
         "max_silence_duration": 1.5,
         "encoding_preset": "veryfast",  # ffmpeg x264 preset: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow

@@ -112,6 +112,21 @@ def _write(cdir: Path, step: str, payload: dict, files: list[str] | None) -> Non
             json.dumps({"files": files}, ensure_ascii=False), encoding="utf-8")
 
 
+def _is_signature(value: Any) -> bool:
+    """True if `value` is a single pre-computed 12-char hex signature.
+
+    Callers (e.g. web_runner) sometimes pre-compute ``pc.signature(...)`` and
+    pass that string directly to get_cached/put_cached. In that case we must
+    NOT re-hash it (doing so double-hashes and silently breaks cache
+    matching). Treat a lone 12-char lowercase-hex string as already a sig.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) == 12
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
 def get_cached(cdir: Path, step: str, *sig_parts: Any) -> dict | None:
     """Return the cached payload for `step` if the signature matches.
 
@@ -119,7 +134,12 @@ def get_cached(cdir: Path, step: str, *sig_parts: Any) -> dict | None:
     """
     if not cdir.exists():
         return None
-    sig = _sig(*sig_parts)
+    # If a single pre-computed signature string was passed, use it directly
+    # instead of re-hashing the hash (which would double-hash and break matching).
+    if len(sig_parts) == 1 and _is_signature(sig_parts[0]):
+        sig = sig_parts[0]
+    else:
+        sig = _sig(*sig_parts)
     if _read_sig(cdir, step) != sig:
         return None
     p = _step_path(cdir, step)
@@ -135,7 +155,11 @@ def put_cached(cdir: Path, step: str, payload: dict,
                files: list[str] | None = None,
                sig_parts: list[Any] | tuple[Any, ...] | None = None) -> None:
     """Persist `payload` (and optional output file list) for `step`."""
-    sig = _sig(*(sig_parts or []))
+    if (sig_parts is not None and len(sig_parts) == 1
+            and _is_signature(sig_parts[0])):
+        sig = sig_parts[0]
+    else:
+        sig = _sig(*(sig_parts or []))
     data = dict(payload)
     data["_sig"] = sig
     _write(cdir, step, data, files)

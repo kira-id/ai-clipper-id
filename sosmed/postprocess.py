@@ -676,6 +676,7 @@ def postprocess_clips(
                 subtitle_position=subtitle_position,
                 subtitle_margin_pct=subtitle_margin_pct,
                 enable_title=enable_title,
+                orientation=orientation,
                 enable_crop=enable_crop,
                 crop_target=crop_target,
                 enable_split_screen=enable_split_screen,

@@ -130,9 +130,26 @@ def transcribe(
 
     condition_prev = False if model_size.startswith("distil-") else True
 
+    # This app always needs word-level timestamps for the burned-in TikTok-style
+    # subtitles. faster-whisper's BatchedInferencePipeline does NOT compute them
+    # (its own docstring: "word_timestamps ... Set as False", and the batched
+    # generate_segments path never calls add_word_timestamps), so forcing
+    # batch_size > 1 would silently produce empty `words` on every segment →
+    # no subtitles in the output. Force the sequential pipeline regardless of the
+    # batch_size setting; the knob stays useful only when word timestamps are
+    # ever explicitly disabled downstream.
+    word_timestamps = True
+    if batch_size > 1:
+        log("WARN",
+            f"word_timestamps=True requested but batch_size={batch_size} "
+            f"disables word-level timestamps in faster-whisper. "
+            f"Forcing batch_size=1 so subtitles are generated correctly "
+            f"(slower, but the only path that yields word timings).")
+        batch_size = 1
+
     transcribe_kwargs = dict(
         language=language,
-        word_timestamps=True,
+        word_timestamps=word_timestamps,
         vad_filter=vad_filter,
         beam_size=5,
         best_of=5,

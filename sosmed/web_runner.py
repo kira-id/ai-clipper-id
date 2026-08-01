@@ -77,6 +77,10 @@ class Job:
         self.logs: list[dict] = []
         self.outputs: list[dict] = []   # final clip files
         self.clips_meta: list[dict] = []  # clip metadata (for the results list)
+        # Per-step intermediate results (surfaced to the dashboard as
+        # collapsible "show output" panels so the user can inspect what each
+        # stage produced before the final clips are rendered).
+        self.step_results: dict[str, dict] = {}
         self.error: str | None = None
         self.finished = False
         self.progress = 0  # 0..100
@@ -111,6 +115,16 @@ class Job:
             self.step_status[name] = "done"
             if detail:
                 self.step_detail[name] = detail
+
+    def set_result(self, name: str, result: dict) -> None:
+        """Attach an intermediate result payload for a step.
+
+        ``result`` should be a small JSON-serialisable dict describing what the
+        step produced (counts, lists, a preview, etc.). It is rendered by the
+        dashboard as a collapsible "show output" panel. Keep it compact.
+        """
+        with self._lock:
+            self.step_results[name] = result
 
     def add_log(self, message: str, level: str = "INFO") -> None:
         with self._lock:
@@ -156,6 +170,7 @@ class Job:
                 "error": self.error,
                 "finished": self.finished,
                 "cache": dict(self.cache),
+                "step_results": dict(self.step_results),
             }
 
 
@@ -307,6 +322,18 @@ def _run(job: Job) -> None:
             job.cache["transcribe"] = True
             job.complete_step("transcribe",
                               f"{len(segments)} segments (cached)")
+            job.set_result("transcribe", {
+                "segments": len(segments),
+                "language": detected_language.get("language", "unknown"),
+                "language_probability": round(
+                    detected_language.get("language_probability", 0.0), 3),
+                "cached": True,
+                "preview": [{
+                    "start": round(s.get("start", 0), 1),
+                    "end": round(s.get("end", 0), 1),
+                    "text": _trim(s.get("text", ""), 180),
+                } for s in segments[:8]],
+            })
         else:
             segments, detected_language = transcribe(
                 video,
@@ -328,6 +355,18 @@ def _run(job: Job) -> None:
             job.complete_step("transcribe",
                               f"{len(segments)} segments · "
                               f"lang {detected_language.get('language','?')}")
+            job.set_result("transcribe", {
+                "segments": len(segments),
+                "language": detected_language.get("language", "unknown"),
+                "language_probability": round(
+                    detected_language.get("language_probability", 0.0), 3),
+                "cached": False,
+                "preview": [{
+                    "start": round(s.get("start", 0), 1),
+                    "end": round(s.get("end", 0), 1),
+                    "text": _trim(s.get("text", ""), 180),
+                } for s in segments[:8]],
+            })
 
         # 2. PREFILTER
         job.set_step("prefilter", "Removing noise / fillers / duplicates…")
@@ -339,14 +378,20 @@ def _run(job: Job) -> None:
             job.complete_step("prefilter",
                               f"{stats['original']} → {stats['kept']} "
                               f"segments kept (cached)")
+            job.set_result("prefilter", _prefilter_result(filtered, stats, True))
         else:
             filtered, stats = prefilter_segments(segments)
             pc.put_cached(cdir, "prefilter",
                           {"segments": filtered, "stats": stats},
                           sig_parts=(sig["prefilter"],))
-            job.cache["prefilter"] = False
+            # A cache entry now exists on disk, so the next run will be fast.
+            # The badge reflects "is cached" (truthful after a fresh run), not
+            # "was served from cache this run" — that distinction lives in the
+            # step detail / step_result.cached field.
+            job.cache["prefilter"] = True
             job.complete_step("prefilter",
                               f"{stats['original']} → {stats['kept']} segments kept")
+            job.set_result("prefilter", _prefilter_result(filtered, stats, False))
 
         if not filtered:
             raise RuntimeError(
@@ -361,20 +406,26 @@ def _run(job: Job) -> None:
             job.cache["energy"] = True
             job.complete_step("energy",
                               f"{len(energy_events)} energy events found (cached)")
+            job.set_result("energy", _energy_result(energy_events, cached=True))
         else:
             energy_events = analyze_audio_energy(video, segments=filtered)
             pc.put_cached(cdir, "energy",
                           {"events": energy_events},
                           sig_parts=(sig["energy"],))
-            job.cache["energy"] = False
+            job.cache["energy"] = True
             job.complete_step("energy",
                               f"{len(energy_events)} energy events found")
+            job.set_result("energy", _energy_result(energy_events, cached=False))
 
         # 4. LLM CLIP SELECTION (with retry — the free LLM can occasionally
         #    return 0 clips on a valid transcript; retry by relaxing the
         #    min-score threshold before giving up.)
         job.set_step("llm_select", "LLM is choosing the best clips…")
         raw_clips_cache = output_dir / ".clips_raw.json"
+        # Capture cache state BEFORE running find_clips — that call writes
+        # .clips_raw.json, so checking existence afterwards would always be
+        # True (and falsely report "cached" on a fresh run).
+        llm_was_cached = raw_clips_cache.exists()
         clips = None
         last_score = int(opts.get("min_score", 55))
         for attempt in range(3):
@@ -399,9 +450,22 @@ def _run(job: Job) -> None:
             )
             if clips:
                 break
-        job.cache["llm_select"] = raw_clips_cache.exists()
+        job.cache["llm_select"] = llm_was_cached
         job.complete_step("llm_select",
                           f"{len(clips)} clips chosen by LLM")
+        job.set_result("llm_select", {
+            "count": len(clips),
+            "min_score": last_score,
+            "cached": llm_was_cached,
+            "clips": [{
+                "rank": c.get("rank"),
+                "start": round(float(c.get("start", 0)), 1),
+                "end": round(float(c.get("end", 0)), 1),
+                "score": round(float(c.get("clip_score", 0) or 0), 1),
+                "title": _trim(c.get("title", ""), 120),
+                "topic": _trim(c.get("topic", ""), 140),
+            } for c in clips[:24]],
+        })
 
         if not clips:
             raise RuntimeError("No engaging clips found. Try lowering "
@@ -415,6 +479,7 @@ def _run(job: Job) -> None:
             job.cache["refine"] = True
             job.complete_step("refine",
                               f"{len(clips)} clips finalized (cached)")
+            job.set_result("refine", _refine_result(clips, cached=True))
         else:
             clips = smart_adjust_clip_boundaries(
                 clips, segments,
@@ -436,9 +501,10 @@ def _run(job: Job) -> None:
             pc.put_cached(cdir, "refine",
                           {"clips": clips},
                           sig_parts=(sig["refine"],))
-            job.cache["refine"] = False
+            job.cache["refine"] = True
             job.complete_step("refine",
                               f"{len(clips)} clips finalized")
+            job.set_result("refine", _refine_result(clips, cached=False))
 
         # persist metadata
         from .utils import save_clips_to_disk
@@ -460,6 +526,7 @@ def _run(job: Job) -> None:
                 job.cache["extract"] = True
                 job.complete_step("extract",
                                   f"{len(raw_outputs)} raw clips (cached)")
+                job.set_result("extract", _extract_result(raw_outputs, cached=True))
             else:
                 # signature matched but raw files were consumed and render
                 # needs them — fall through to a real re-extract below
@@ -476,9 +543,10 @@ def _run(job: Job) -> None:
                           {"outputs": raw_outputs},
                           files=raw_outputs,
                           sig_parts=(sig["extract"],))
-            job.cache["extract"] = False
+            job.cache["extract"] = True
             job.complete_step("extract",
                               f"{len(raw_outputs)} raw clips extracted")
+            job.set_result("extract", _extract_result(raw_outputs, cached=False))
 
         # 7. RENDER (subtitles / crop / cta / silence removal)
         job.set_step("render", "Burning subtitles & post-processing…")
@@ -496,6 +564,7 @@ def _run(job: Job) -> None:
             job.cache["render"] = bool(outputs)
             job.complete_step("render",
                               f"{len(outputs)} clips rendered (cached)")
+            job.set_result("render", _render_result(outputs, cached=True))
         elif any_pp and raw_outputs:
             # prepare subtitle words for ALL clips in one batched LLM call
             # (previously one serial call per clip — the dominant runtime cost)
@@ -543,13 +612,16 @@ def _run(job: Job) -> None:
                           {"outputs": outputs},
                           files=outputs,
                           sig_parts=(sig["render"],))
-            job.cache["render"] = False
+            job.cache["render"] = True
             job.complete_step("render",
                               f"{len(outputs)} clips rendered")
+            job.set_result("render", _render_result(outputs, cached=False))
         else:
             outputs = raw_outputs
             job.cache["render"] = False
             job.complete_step("render", "raw clips (no post-processing)")
+            job.set_result("render", _render_result(outputs, cached=False,
+                                                    note="no post-processing"))
 
         # collect outputs + metadata
         for clip in clips:
@@ -587,6 +659,82 @@ def _run(job: Job) -> None:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
+def _trim(text: str, n: int) -> str:
+    """Truncate a string for preview payloads."""
+    if not text:
+        return ""
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _prefilter_result(filtered: list, stats: dict, cached: bool) -> dict:
+    return {
+        "original": stats.get("original"),
+        "after_filter": stats.get("after_filter"),
+        "kept": stats.get("kept"),
+        "dropped": stats.get("dropped"),
+        "merged": stats.get("merged"),
+        "drop_pct": stats.get("drop_pct"),
+        "reasons": stats.get("reasons", {}),
+        "cached": cached,
+        "preview": [{
+            "start": round(s.get("start", 0), 1),
+            "end": round(s.get("end", 0), 1),
+            "text": _trim(s.get("text", ""), 140),
+        } for s in filtered[:8]],
+    }
+
+
+def _energy_result(events: list, cached: bool) -> dict:
+    labels = {}
+    for e in events:
+        labels[e.get("label", "peak")] = labels.get(e.get("label", "peak"), 0) + 1
+    return {
+        "count": len(events),
+        "cached": cached,
+        "labels": labels,
+        "preview": [{
+            "start": round(e.get("start", 0), 1),
+            "end": round(e.get("end", 0), 1),
+            "label": e.get("label", ""),
+            "intensity": round(e.get("intensity", 0), 2)
+            if e.get("intensity") is not None else None,
+        } for e in events[:12]],
+    }
+
+
+def _refine_result(clips: list, cached: bool) -> dict:
+    return {
+        "count": len(clips),
+        "cached": cached,
+        "clips": [{
+            "rank": c.get("rank"),
+            "start": round(float(c.get("start", 0)), 1),
+            "end": round(float(c.get("end", 0)), 1),
+            "score": round(float(c.get("clip_score", 0) or 0), 1),
+            "title": _trim(c.get("title", ""), 120),
+            "caption": _trim(c.get("caption", ""), 160),
+        } for c in clips[:24]],
+    }
+
+
+def _extract_result(raw_outputs: list, cached: bool) -> dict:
+    return {
+        "count": len(raw_outputs),
+        "cached": cached,
+        "files": [Path(p).name for p in raw_outputs[:24]],
+    }
+
+
+def _render_result(outputs: list, cached: bool, note: str = "") -> dict:
+    return {
+        "count": len(outputs),
+        "cached": cached,
+        "note": note,
+        "files": [Path(p).name for p in outputs[:24]],
+    }
+
+
 def load_dotenv_safe() -> None:
     try:
         from dotenv import load_dotenv

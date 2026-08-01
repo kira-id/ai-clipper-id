@@ -1,9 +1,9 @@
 """
 Subtitle generation (ASS format) — clean, non-overlapping, lower-third.
 
-Generates word-by-word highlighted subtitles. Each word appears individually
-with yellow highlight on the currently spoken word. Professional design
-with modern font styling optimized for TikTok/Reels/Shorts.
+Generates subtitles with white text and a black outline, no shadow/glow.
+Professional design with modern font styling optimized for
+TikTok/Reels/Shorts.
 """
 
 from typing import Any
@@ -16,10 +16,10 @@ def _rgb_to_ass(r: int, g: int, b: int, a: int = 0) -> str:
     return f"&H{a:02X}{b:02X}{g:02X}{r:02X}"
 
 
-COLOR_HIGHLIGHT = _rgb_to_ass(255, 225, 53)      # Yellow (current word)
-COLOR_NORMAL    = _rgb_to_ass(0, 0, 0)            # Black (other words)
-COLOR_OUTLINE   = _rgb_to_ass(255, 255, 255)      # White outline (halo → readable on dark bg)
-COLOR_GLOW      = _rgb_to_ass(255, 255, 255, 90)  # White glow (soft halo)
+COLOR_HIGHLIGHT = _rgb_to_ass(255, 255, 255)      # White (unused — no per-word highlight)
+COLOR_NORMAL    = _rgb_to_ass(255, 255, 255)      # White (subtitle text)
+COLOR_OUTLINE   = _rgb_to_ass(0, 0, 0)            # Black outline (halo → readable on any bg)
+COLOR_GLOW      = _rgb_to_ass(255, 255, 255, 0)   # Transparent (no shadow/glow)
 
 
 def _seconds_to_ass_time(seconds: float) -> str:
@@ -108,18 +108,17 @@ def generate_ass_subtitles(
     max_words_per_group: int = 4,
     subtitle_margin_pct: float | None = None,
 ) -> str:
-    """Generate ASS subtitles with word-by-word yellow highlight.
+    """Generate ASS subtitles with white text and a black outline.
 
     Design choices for professional shorts:
     - **Single line** max (no two-line subtitles) — WrapStyle:2 keeps long
       groups on one line with ellipsis rather than overflowing the frame
-    - **Word-by-word highlight**: each word turns yellow when spoken,
-      NOT karaoke sweep — discrete per-word color change
+    - **White text** with a thin black outline so it reads on any footage
+    - **No shadow / no glow** (removed per request)
     - **Bigger** font (3.6% portrait baseline) for high legibility
     - **Lower position** (25% from bottom by default) to avoid face occlusion
     - **Modern font**: Montserrat (falls back to Arial if unavailable)
     - **No temporal overlap** between subtitle groups
-    - **Black text** with white halo so it reads on bright footage
     - **Portrait overflow guard**: extra word cap + larger horizontal margins
       so text never runs off the narrow frame edges
     """
@@ -130,13 +129,20 @@ def generate_ass_subtitles(
     effective_pct = _adapt_for_aspect_ratio(play_res_x, play_res_y, font_size_pct)
     font_size = _resolve_font_size(play_res_y, effective_pct)
     outline_w = _resolve_outline(play_res_y, effective_pct)
-    shadow_depth = max(2, outline_w)  # Larger soft white base for the glow
-    GLOW_BLUR = 3  # Edge blur → white halo / glow around the text
+    shadow_depth = 0  # No shadow / glow
+    GLOW_BLUR = 0     # No blur
 
     # ── Alignment & margins ──────────────────────────────────────────────
-    default_lower_margin = subtitle_margin_pct if subtitle_margin_pct is not None else 25.0
+    is_portrait = (play_res_x / max(1, play_res_y)) < 1.0
+    # Default 10% from bottom (low on screen). Portrait frames have a
+    # description/caption strip pinned to the very bottom, so the lower
+    # subtitle would be hidden behind it — push it further up there.
+    if is_portrait and subtitle_margin_pct is None:
+        default_lower_margin = 20.0
+    else:
+        default_lower_margin = subtitle_margin_pct if subtitle_margin_pct is not None else 10.0
     margin_pct = {
-        "lower":  default_lower_margin,  # Adjustable, default 25% from bottom
+        "lower":  default_lower_margin,
         "center": 0.0,
         "upper":  5.0,
     }
@@ -148,9 +154,8 @@ def generate_ass_subtitles(
     margin_h_pct = 10.0 if (play_res_x / max(1, play_res_y)) < 1.0 else 8.0
     margin_h = round(play_res_x * margin_h_pct / 100.0)
 
-    # ── ASS header with two styles ───────────────────────────────────────
-    # Style "Word": normal white word
-    # Style "WordHi": highlighted yellow word (currently spoken)
+    # ── ASS header with one style ────────────────────────────────────────
+    # Style "Word": white text, black outline, no shadow
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -164,14 +169,9 @@ def generate_ass_subtitles(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        # Normal word style (white)
+        # Word style (white text, black outline)
         f"Style: Word,{font_name},{font_size},"
         f"{nm_color},{nm_color},{COLOR_OUTLINE},{COLOR_GLOW},"
-        f"-1,0,0,0,100,100,1.0,0,1,{outline_w},{shadow_depth},"
-        f"{alignment},{margin_h},{margin_h},{margin_v},1\n"
-        # Highlighted word style (yellow) — same positioning
-        f"Style: WordHi,{font_name},{font_size},"
-        f"{hi_color},{hi_color},{COLOR_OUTLINE},{COLOR_GLOW},"
         f"-1,0,0,0,100,100,1.0,0,1,{outline_w},{shadow_depth},"
         f"{alignment},{margin_h},{margin_h},{margin_v},1\n"
         "\n"
@@ -205,10 +205,7 @@ def generate_ass_subtitles(
             ge = gs + 0.1
         clamped.append((gs, ge))
 
-    # ── Build dialogue lines with word-by-word highlight ─────────────────
-    # For each group, we emit one dialogue line per word-timing where
-    # the currently spoken word is yellow and all others are white.
-    # This creates a discrete word-by-word highlight (not karaoke sweep).
+    # ── Build dialogue lines: one line per group, all white, no highlight ──
     dialogue_lines: list[str] = []
 
     for group, (g_start, g_end) in zip(groups, clamped):
@@ -221,41 +218,11 @@ def generate_ass_subtitles(
         if not clean_words:
             continue
 
-        # For each word in the group, create a dialogue event where
-        # that word is highlighted and others are normal
-        for word_idx, (word_text, w_start, w_end) in enumerate(clean_words):
-            # This word's display period
-            if word_idx == 0:
-                event_start = g_start
-            else:
-                event_start = clean_words[word_idx][1]
-
-            if word_idx < len(clean_words) - 1:
-                event_end = clean_words[word_idx + 1][1]
-            else:
-                event_end = g_end
-
-            # Clamp
-            event_start = max(g_start, event_start)
-            event_end = min(g_end, event_end)
-            if event_end <= event_start:
-                event_end = event_start + 0.05
-
-            start_str = _seconds_to_ass_time(event_start)
-            end_str = _seconds_to_ass_time(event_end)
-
-            # Build text with inline override: highlight current word
-            parts = []
-            for j, (wt, _, _) in enumerate(clean_words):
-                if j == word_idx:
-                    # Yellow highlight for current word
-                    parts.append(f"{{\\c{hi_color}}}{wt}{{\\c{nm_color}}}")
-                else:
-                    parts.append(wt)
-
-            text = " ".join(parts)
-            line = f"Dialogue: 0,{start_str},{end_str},Word,,0,0,0,,{{\\blur{GLOW_BLUR}}}{text}"
-            dialogue_lines.append(line)
+        text = " ".join(wt for wt, _, _ in clean_words)
+        start_str = _seconds_to_ass_time(g_start)
+        end_str = _seconds_to_ass_time(g_end)
+        line = f"Dialogue: 0,{start_str},{end_str},Word,,0,0,0,,{text}"
+        dialogue_lines.append(line)
 
     return header + "\n".join(dialogue_lines) + "\n"
 
@@ -269,9 +236,11 @@ def generate_title_overlay(
 ) -> str:
     """Generate ASS title overlay with professional design.
 
-    Modern, clean title with:
+    Modern title banner with:
     - Montserrat font (professional, widely available)
-    - Semi-transparent dark background pill behind text
+    - YELLOW parallelogram background, sheared via \\fax (background layer ONLY)
+    - BLACK, BOLD, UPRIGHT text (NO italic — shear is NOT applied to the text)
+    - NO outline / NO shadow on the text
     - Fade-out animation
     - Positioned at upper-third (25% from top)
     """
@@ -282,29 +251,43 @@ def generate_title_overlay(
     else:
         font_size = int(play_res_y * 0.10)
 
-    outline_w = max(4, int(font_size * 0.15))  # Thicker outline for rounded effect
-    shadow_d = max(3, int(font_size * 0.12))   # Larger shadow for soft rounded corners
+    # Colors: WHITE title text on a YELLOW parallelogram. No text outline.
+    c_text = _rgb_to_ass(255, 255, 255)       # WHITE title text (contrasts yellow)
 
-    # Colors: black text on a yellow background pill
-    c_text = _rgb_to_ass(0, 0, 0)
-    c_outline = _rgb_to_ass(0, 0, 0)
-    c_shadow = _rgb_to_ass(0, 0, 0, 100)
+    # ── Filled parallelogram background ───────────────────────────────────
+    # Drawn as a TRUE solid vector polygon (a sheared rectangle) via ASS
+    # Drawing commands, so it is a clean block of color — NOT a fake
+    # text-glyph box. The readable title is drawn on top as a separate
+    # upright layer.
+    # ~14deg shear = tan(14) ≈ 0.25.
+    shear = 0.25
 
-    # Position: 25% from top
+    # Banner geometry: centered at upper-third (25% from top).
     cx = play_res_x // 2
     cy = int(play_res_y * 0.25)
 
-    # Fade timing
+    # Wide block that spans most of the frame so long titles fit.
+    banner_w = int(play_res_x * 0.92)
+    banner_h = int(font_size * 1.9)           # tall enough to enclose the text
+    half_w = banner_w // 2
+    half_h = banner_h // 2
+
+    # Four corners of an axis-aligned rectangle, sheared into a parallelogram
+    # by shifting each corner's x by `shear * (y - cy)`.
+    tl = (cx - half_w + int(shear * -half_h), cy - half_h)
+    tr = (cx + half_w + int(shear * -half_h), cy - half_h)
+    br = (cx + half_w + int(shear *  half_h), cy + half_h)
+    bl = (cx - half_w + int(shear *  half_h), cy + half_h)
+
+    # Fade timing (applied to BOTH box + text so they vanish together)
     if duration < 1.5:
         fade_out_dur = max(100, int(duration * 200))
     else:
         fade_out_dur = int(0.5 * 1000)
     fade_out_start = max(0, int((duration - (fade_out_dur / 1000)) * 1000))
 
-    margin_h = round(play_res_x * 5.0 / 100.0)
-
-    # Background box style (BorderStyle=3 creates a box behind text)
-    bg_color = _rgb_to_ass(255, 225, 53, 235)  # opaque-ish yellow
+    # Opaque yellow block color (Alpha 00 = fully opaque in &HAABBGGRR).
+    c_block = _rgb_to_ass(255, 225, 53, 0)
 
     header = (
         "[Script Info]\n"
@@ -319,11 +302,19 @@ def generate_title_overlay(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        # BorderStyle=3 = opaque box background
-        f"Style: Title,{font_name},{font_size},"
-        f"{c_text},{c_text},{c_outline},{bg_color},"
-        f"-1,0,0,0,100,100,0.5,0,3,{outline_w},{shadow_d},"
-        f"5,{margin_h},{margin_h},0,1\n"
+        # --- Parallelogram background: a solid filled vector polygon ---
+        # Alignment 7 (top-left) + the \pos(0,0) in the drawing so the Drawing
+        # commands use absolute script-resolution pixel coordinates (0,0 = frame
+        # top-left) instead of anchoring at screen center.
+        f"Style: TitleBox,{font_name},{font_size},"
+        f"{c_block},{c_block},{c_block},{c_block},"
+        f"-1,0,0,0,100,100,0.5,0,1,0,0,"
+        f"7,0,0,0,1\n"
+        # --- Title text: upright, bold, white, drawn on top ---
+        f"Style: TitleText,{font_name},{font_size},"
+        f"{c_text},{c_text},{c_text},{c_text},"
+        f"-1,0,0,0,100,100,0.5,0,1,0,0,"
+        f"5,0,0,0,1\n"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, "
@@ -333,16 +324,32 @@ def generate_title_overlay(
     t0 = _seconds_to_ass_time(0.0)
     t1 = _seconds_to_ass_time(duration)
 
-    anim = (
+    # Background parallelogram: a solid filled polygon (sheared rectangle),
+    # fades out in sync with the title text.
+    box_anim = (
+        "{\\p1"
+        "\\pos(0,0)"
+        f"\\alpha&H00"
+        f"\\t({fade_out_start},{fade_out_start + fade_out_dur},\\alpha&HFF)"
+        "}"
+        f"m {tl[0]} {tl[1]} "
+        f"l {tr[0]} {tr[1]} "
+        f"l {br[0]} {br[1]} "
+        f"l {bl[0]} {bl[1]} "
+        f"l {tl[0]} {tl[1]}"
+    )
+    # Title text: upright, bold, fades out in sync (NO shear → no italic).
+    text_anim = (
         f"{{\\pos({cx},{cy})\\an5"
         f"\\alpha&H00"
         f"\\t({fade_out_start},{fade_out_start + fade_out_dur},\\alpha&HFF)"
         f"}}"
     )
 
-    event = f"Dialogue: 0,{t0},{t1},Title,,0,0,0,,{anim}{title}"
+    box_event  = f"Dialogue: 0,{t0},{t1},TitleBox,,0,0,0,,{box_anim}"
+    text_event = f"Dialogue: 1,{t0},{t1},TitleText,,0,0,0,,{text_anim}{title}"
 
-    return header + event + "\n"
+    return header + box_event + "\n" + text_event + "\n"
 
 
 def get_clip_words(
