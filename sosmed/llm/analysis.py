@@ -5,7 +5,6 @@ LLM analysis: find engaging clips in transcript.
 import hashlib
 import json
 import math
-import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -144,39 +143,25 @@ def _build_user_prompt(
     return f"{header}\nTRANSKRIP:\n{transcript}"
 
 
-def _compute_clip_score(c: dict[str, Any]) -> float:
+def _clip_score(c: dict[str, Any]) -> float:
     """
-    Compute clip_score using education-first weighting.
+    Compute clip_score from the four model-emitted sub-scores.
 
-    Weights: educational clarity 40%, hook 30%, retention 20%, teaching voice 10%.
-    Falls back to legacy field names if new ones are missing.
+    Weights (from SYSTEM_PROMPT): educational clarity 40%, hook 30%,
+    retention 20%, teaching voice 10%.  Returns 0.0 when no scores are
+    present so the validator's min_score gate drops unscoreable clips.
     """
-    scores = _normalize_score_fields(c)
-    emotion = scores["score_emotion"]
-    hook = scores["score_hook"]
-    retention = scores["score_retention"]
-    personality = scores["score_personality"]
-
-    # If all new scores are missing but original clip_score exists, preserve it
-    has_original_score = "clip_score" in c and isinstance(c.get("clip_score"), (int, float))
-    has_new_fields = any(c.get(f) is not None for f in [
-        "score_emotion", "score_hook", "score_retention", "score_personality"
-    ])
-
-    if has_original_score and not has_new_fields and c["clip_score"] > 0:
-        return float(c["clip_score"])
-
+    emotion = _to_score(c.get("score_emotion"))
+    hook = _to_score(c.get("score_hook"))
+    retention = _to_score(c.get("score_retention"))
+    personality = _to_score(c.get("score_personality"))
     total = emotion + hook + retention + personality
-    if total > 0:
-        return round(
-            emotion * 0.40
-            + hook * 0.30
-            + retention * 0.20
-            + personality * 0.10,
-            1,
-        )
-
-    return 70.0
+    if total == 0:
+        return 0.0
+    return round(
+        emotion * 0.40 + hook * 0.30 + retention * 0.20 + personality * 0.10,
+        1,
+    )
 
 
 def _to_score(value: Any) -> int:
@@ -188,75 +173,6 @@ def _to_score(value: Any) -> int:
     return max(0, min(100, n))
 
 
-def _normalize_score_fields(c: dict[str, Any]) -> dict[str, int]:
-    """
-    Normalize per-dimension score fields to keep output stable.
-    Falls back to legacy score fields if new ones are missing.
-
-    New format: score_emotion, score_hook, score_retention, score_personality
-    Old format: score_hook, score_insight_density, score_retention,
-                score_emotional_payoff, score_clarity
-    Very old:   score_newsworthy, score_informative, score_energy,
-                score_entertainment, score_easy
-    """
-    # Detect which format the clip uses by checking for format-specific keys
-    has_new = "score_emotion" in c or "score_personality" in c
-    has_old = "score_emotional_payoff" in c or "score_insight_density" in c or "score_clarity" in c
-    has_very_old = "score_newsworthy" in c or "score_entertainment" in c or "score_easy" in c
-
-    if has_new:
-        # New gaming format — use directly
-        return {
-            "score_emotion": _to_score(c.get("score_emotion")),
-            "score_hook": _to_score(c.get("score_hook")),
-            "score_retention": _to_score(c.get("score_retention")),
-            "score_personality": _to_score(c.get("score_personality")),
-        }
-    elif has_old:
-        # Old educational format — map to gaming scores
-        return {
-            "score_emotion": _to_score(c.get("score_emotional_payoff")),
-            "score_hook": _to_score(c.get("score_hook")),
-            "score_retention": _to_score(c.get("score_retention")),
-            "score_personality": _to_score(c.get("score_insight_density", c.get("score_clarity"))),
-        }
-    elif has_very_old:
-        # Very old format
-        return {
-            "score_emotion": _to_score(c.get("score_entertainment")),
-            "score_hook": _to_score(c.get("score_newsworthy", c.get("score_shareability"))),
-            "score_retention": _to_score(c.get("score_energy")),
-            "score_personality": _to_score(c.get("score_easy", c.get("score_informative"))),
-        }
-    else:
-        # Unknown / no score fields — try common names as best effort
-        return {
-            "score_emotion": _to_score(c.get("score_emotion")),
-            "score_hook": _to_score(c.get("score_hook")),
-            "score_retention": _to_score(c.get("score_retention")),
-            "score_personality": _to_score(c.get("score_personality")),
-        }
-
-
-# Titles/topics that indicate non-viral content (intros, outros, etc.)
-# NOTE: Q&A / tanya jawab is NOT excluded — often contains great insights
-_LOW_VALUE_PATTERNS = re.compile(
-    r"(?i)"
-    r"(?:selamat datang|pembuka|opening|penutup|closing|terima kasih|"
-    r"thank you|perkenalan|introduction|polling|vote|subscribe|"
-    r"topik yang akan|webinar akan|rekaman|pendekatan materi|"
-    r"ajak partisipasi|sapa penonton|ucapan|disclaimer|house\s*keeping)"
-)
-
-
-def _is_low_value_clip(c: dict[str, Any]) -> bool:
-    """Check if clip is likely low-value (intro, outro, generic Q&A, etc.)."""
-    title = (c.get("title", "") or "").strip()
-    topic = (c.get("topic", "") or "").strip()
-    combined = f"{title} {topic}"
-    return bool(_LOW_VALUE_PATTERNS.search(combined))
-
-
 def _validate_clips(
     clips: list[dict[str, Any]],
     min_dur: int,
@@ -265,24 +181,35 @@ def _validate_clips(
     min_score: int,
     video_duration: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Sanitize, deduplicate, and cap the clip list — strict quality gate for viral hits only."""
+    """Sanitize, deduplicate, and cap the clip list — keep the best educational clips.
+
+    Selection is driven solely by the model-emitted score_* sub-scores via
+    ``_clip_score`` and the caller's ``min_score`` floor.  We deliberately do
+    NOT re-impose per-dimension viral floors: the live ``SYSTEM_PROMPT``
+    instructs the model to emit inclusive, education-first scores, and a
+    second, contradictory gate here only drops otherwise-good clips.
+    """
     valid: list[dict[str, Any]] = []
     seen_ranges: list[tuple[float, float]] = []
 
-    # Sort by score descending first so higher-quality clips get priority
+    # Pre-compute scores once; drop any clip missing both score_* fields and a
+    # usable clip_score (the model must grade what it returns).
     scored_clips = []
     for c in clips:
         try:
             s, e = float(c["start"]), float(c["end"])
         except (KeyError, ValueError, TypeError):
             continue
-        score = _compute_clip_score(c)
-        # Penalize low-value clips (intros, outros, disclaimers)
-        if _is_low_value_clip(c):
-            score = max(0, score - 25)
+        score = _clip_score(c)
+        if score == 0.0 and not (
+            isinstance(c.get("clip_score"), (int, float)) and c["clip_score"] > 0
+        ):
+            log("DEBUG", f"Skip '{c.get('title', '?')}' [{s:.0f}-{e:.0f}]: no score_* fields")
+            continue
         c["_score"] = score
         scored_clips.append(c)
-    # Tiebreaker: score_emotion (emotional intensity is #1 virality predictor for gaming)
+    # Highest clip_score first; emotion is the secondary tiebreak (the
+    # strongest educational-weight signal per SYSTEM_PROMPT).
     scored_clips.sort(key=lambda x: (-x["_score"], -int(x.get("score_emotion", 0) or 0)))
 
     for c in scored_clips:
@@ -302,41 +229,13 @@ def _validate_clips(
 
         score = c["_score"]
 
-        # Minimum score check
+        # Minimum score check (single, explicit floor from the caller)
         if score < min_score:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: score {score:.1f} < {min_score}")
             continue
 
-        # VIRAL REQUIREMENTS: Enforce strict score floors
-        emotion_score = int(c.get("score_emotion", 0) or 0)
-        retention_score = int(c.get("score_retention", 0) or 0)
-
-        # Emotion must be engaging (≥60)
-        if emotion_score < 60:
-            log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: emotion score {emotion_score} < 60 (flat)")
-            continue
-
-        # Must have strong ending (retention ≥50)
-        if retention_score < 50:
-            log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: retention score {retention_score} < 50 (weak ending)")
-            continue
-
-        # At least two scores must be ≥70 (viral-tier quality)
-        all_scores = [
-            emotion_score,
-            int(c.get("score_hook", 0) or 0),
-            retention_score,
-            int(c.get("score_personality", 0) or 0),
-        ]
-        high_scores = sum(1 for s_val in all_scores if s_val >= 70)
-        if high_scores < 2:
-            log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: only {high_scores} scores ≥70 (need 2+)")
-            continue
-
-        # Normalize score fields for output
-        normalized = _normalize_score_fields(c)
-        
-        # Overlap check — no near-duplicates
+        # Overlap check — no near-duplicates (see _merge_chunk_clips for the
+        # keep-the-longer-clip policy applied earlier in the pipeline).
         def _overlap_ratio(s1: float, e1: float, s2: float, e2: float) -> float:
             overlap = max(0, min(e1, e2) - max(s1, s2))
             shorter = min(e1 - s1, e2 - s2)
@@ -346,43 +245,30 @@ def _validate_clips(
         if overlaps:
             log("DEBUG", f"Skip '{title}' [{s:.0f}-{e:.0f}]: overlaps with existing clip")
             continue
-        
+
         seen_ranges.append((s, e))
-        
+
         # Ensure required fields
         c.setdefault("rank", len(valid) + 1)
-        c.setdefault("title", f"Clip {c['rank']}")
         c.setdefault("reason", "")
         c.setdefault("topic", "")
         c.setdefault("caption", "")
         c.setdefault("hook", "")
         c.setdefault("closing_line", "")
         c.setdefault("comment_bait", "")
-        c.update(normalized)
+        c.setdefault("social_description", "")
+        # Never allow a bare "Clip N" title — derive a real one if needed.
+        from .utils import ensure_real_title
+        ensure_real_title(c, fallback_rank=c.get("rank"))
         c["clip_score"] = score
         c.pop("_score", None)
         c.pop("engagement_score", None)
-        
-        # Remove score fields from older algorithms if present
-        for legacy in (
-            "score_shareability",
-            "score_educational",
-            "score_entertainment",
-            "score_easy",
-            "score_informative",
-            "score_energy",
-            "score_newsworthy",
-            "score_insight_density",
-            "score_emotional_payoff",
-            "score_clarity",
-        ):
-            c.pop(legacy, None)
 
         valid.append(c)
         if len(valid) >= max_clips:
             break
 
-    # Re-rank by clip_score, tiebreak by emotion (strongest virality signal for gaming)
+    # Re-rank by clip_score, tiebreak by emotion (strongest educational-weight signal).
     valid.sort(key=lambda x: (-x.get("clip_score", 0), -int(x.get("score_emotion", 0) or 0)))
     for i, c in enumerate(valid, 1):
         c["rank"] = i
@@ -402,10 +288,10 @@ def _merge_chunk_clips(
     Merge clips from multiple LLM chunks, removing near-duplicates.
 
     Two clips are considered duplicates if they overlap by > 30%.
-    When duplicates are found, keep the one with the higher score.
+    When duplicates are found, keep the more complete (longer) clip.
     """
     # Sort all clips by start time
-    all_clips.sort(key=lambda c: (float(c.get("start", 0)), -_compute_clip_score(c)))
+    all_clips.sort(key=lambda c: (float(c.get("start", 0)), -_clip_score(c)))
 
     deduped: list[dict[str, Any]] = []
     for clip in all_clips:
@@ -421,8 +307,16 @@ def _merge_chunk_clips(
             overlap = max(0, min(e, ee) - max(s, es))
             shorter = min(e - s, ee - es)
             if shorter > 0 and overlap / shorter > 0.7:
-                # Keep the higher-scoring one
-                if _compute_clip_score(clip) > _compute_clip_score(existing):
+                # Pick the more COMPLETE clip: a clip that fully contains (or is
+                # much longer than) another is the better standalone moment to
+                # ship.  Prefer the longer one; only fall back to the higher
+                # score when lengths are within ~5s of each other.
+                clip_dur = e - s
+                existing_dur = ee - es
+                if clip_dur > existing_dur + 5 or (
+                    abs(clip_dur - existing_dur) <= 5
+                    and _clip_score(clip) > _clip_score(existing)
+                ):
                     deduped[i] = clip
                 is_dup = True
                 break
@@ -433,50 +327,6 @@ def _merge_chunk_clips(
 
     # Now validate the deduped list
     return _validate_clips(deduped, min_dur, max_dur, max_clips, min_score, video_duration)
-
-
-def _find_gaps(
-    clips: list[dict[str, Any]],
-    segments: list[dict[str, Any]],
-    min_gap: float = 30.0,
-) -> list[tuple[float, float]]:
-    """
-    Find time ranges in the transcript not covered by any clip.
-
-    Returns list of (start, end) tuples for gaps >= min_gap seconds.
-    """
-    if not segments:
-        return []
-
-    total_start = segments[0]["start"]
-    total_end = segments[-1]["end"]
-
-    # Sort clips by start time
-    sorted_clips = sorted(clips, key=lambda c: float(c.get("start", 0)))
-
-    gaps: list[tuple[float, float]] = []
-    cursor = total_start
-
-    for c in sorted_clips:
-        cs, ce = float(c["start"]), float(c["end"])
-        if cs > cursor + min_gap:
-            gaps.append((cursor, cs))
-        cursor = max(cursor, ce)
-
-    # Check trailing gap
-    if total_end > cursor + min_gap:
-        gaps.append((cursor, total_end))
-
-    return gaps
-
-
-def _segments_in_range(
-    segments: list[dict[str, Any]],
-    start: float,
-    end: float,
-) -> list[dict[str, Any]]:
-    """Return segments that overlap with the given time range."""
-    return [s for s in segments if s["end"] > start and s["start"] < end]
 
 
 def _resolve_raw_cache_path(
@@ -539,17 +389,14 @@ def find_clips(
     system_prompt: str | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Ask LLM to find ALL engaging clips (up to *max_clips*).
+    Ask LLM to find educational clips (up to *max_clips*).
 
-    For long videos (> ~8 min of transcript), splits transcript into
-    overlapping chunks and calls the LLM iteratively on each chunk,
-    then merges and deduplicates results across all chunks.
+    For long videos, splits the transcript into overlapping chunks and calls
+    the LLM on each chunk, then merges and deduplicates results across chunks
+    (overlapping/duplicate moments are collapsed, keeping the more complete clip).
 
-    After the first pass, identifies large gaps (uncovered time ranges)
-    and does a second LLM pass to extract additional clips from those gaps.
-    
-    If raw_clips_cache_file is provided and exists, loads cached raw LLM results
-    instead of calling LLM again.
+    If raw_clips_cache_file is provided and exists, loads cached raw LLM
+    results instead of calling the LLM again.
     """
     if raw_clips_cache_file:
         raw_clips_cache_file = _resolve_raw_cache_path(

@@ -116,6 +116,20 @@
       <div class="hint">Needs a translation key (OpenRouter) when translating. Leave blank to use the key in your .env.</div>
     </div>
 
+    <label>OpenRouter model</label>
+    <select id="llm_model_preset">
+      <option value="poolside/laguna-xs-2.1:free" selected>poolside/laguna-xs-2.1:free</option>
+      <option value="openrouter/free">openrouter/free (no key needed)</option>
+      <option value="openrouter/auto">openrouter/auto</option>
+      <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
+      <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
+      <option value="google/gemini-flash-1.5">google/gemini-flash-1.5</option>
+      <option value="deepseek/deepseek-chat">deepseek/deepseek-chat</option>
+      <option value="custom">Custom…</option>
+    </select>
+    <input type="text" id="llm_model" class="hidden" placeholder="e.g. openrouter/free">
+    <div class="hint hidden" id="llm_hint">Custom OpenRouter model id. Leave blank to use the preset above (or the config default).</div>
+
     <div class="row">
       <div>
         <label>Subtitle position</label>
@@ -124,6 +138,11 @@
           <option value="center">Center</option>
           <option value="upper">Upper</option>
         </select>
+      </div>
+      <div>
+        <label>Subtitle font size (%)</label>
+        <input type="number" id="subtitle_font_size_pct" step="0.1" min="1" max="10" placeholder="3.2">
+        <div class="hint" style="margin-top:4px">% of video height. Leave blank → default (3.2, a bit smaller).</div>
       </div>
       <div>
         <label>Whisper model</label>
@@ -158,6 +177,9 @@
     </div>
 
     <button class="btn" id="startBtn" disabled>Render subtitled video</button>
+    <button class="btn" id="mockBtn" type="button"
+      style="margin-top:10px;background:linear-gradient(180deg,#c792ff,#9b59ff);color:#1a0b2e">✨ Preview mock subtitle</button>
+    <div class="hint" style="margin-top:6px">Renders a sample clip with the <b>real</b> subtitle-burning code (no upload, no API key) so you can quickly check the look.</div>
     <div class="err" id="formErr"></div>
   </div>
 

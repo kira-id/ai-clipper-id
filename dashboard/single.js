@@ -77,8 +77,57 @@
     translateOpts.classList.toggle("hidden", mode !== "translate");
   });
 
-  // ── start ──
+  // ── OpenRouter model preset toggle ──
+  const llmPreset = $("llm_model_preset");
+  const llmCustom = $("llm_model");
+  const llmHint = $("llm_hint");
+  llmPreset.addEventListener("change", () => {
+    const custom = llmPreset.value === "custom";
+    llmCustom.classList.toggle("hidden", !custom);
+    llmHint.classList.toggle("hidden", !custom);
+  });
+  function resolveLLMModel() {
+    return llmCustom.value.trim() || llmPreset.value;
+  }
+
+  // ── start (real run) ──
   startBtn.addEventListener("click", start);
+
+  // ── mock preview (no upload, no API key) ──
+  $("mockBtn").addEventListener("click", () => {
+    formErr.textContent = "";
+    // Reuse the same progress + result UI as a real run; just hit the mock
+    // endpoint. The server burns a sample clip with the REAL subtitle code.
+    const fd = new FormData();
+    fd.append("subtitle_position", $("subtitle_position").value);
+    fd.append("subtitle_mode", mode);  // original / translate
+    const fsz = $("subtitle_font_size_pct").value.trim();
+    if (fsz) fd.append("subtitle_font_size_pct", fsz);
+
+    startBtn.disabled = true;
+    $("mockBtn").disabled = true;
+    setupCard.style.opacity = ".6";
+    progCard.classList.remove("hidden");
+    resultCard.classList.add("hidden");
+    buildStepper(["upload", "transcribe", "subtitles", "render", "done"]);
+    bar.style.width = "0%";
+    logEl.innerHTML = "";
+    stepDetail.textContent = "Rendering mock subtitle preview…";
+
+    fetch("/api/single/mock", { method: "POST", body: fd })
+      .then((r) => r.json())
+      .then((data) => {
+        if (data.error) throw new Error(data.error);
+        poll(data.job_id);
+      })
+      .catch((err) => {
+        formErr.textContent = err.message || "Mock preview failed.";
+        startBtn.disabled = false;
+        $("mockBtn").disabled = false;
+        setupCard.style.opacity = "1";
+        progCard.classList.add("hidden");
+      });
+  });
 
   function start() {
     formErr.textContent = "";
@@ -105,12 +154,15 @@
     }
     fd.append("subtitle_mode", mode);
     fd.append("subtitle_position", $("subtitle_position").value);
+    const fsz2 = $("subtitle_font_size_pct").value.trim();
+    if (fsz2) fd.append("subtitle_font_size_pct", fsz2);
     fd.append("target_language", $("target_language").value);
     fd.append("model", $("model").value);
     fd.append("lang", $("lang").value);
     fd.append("encoding_crf", $("encoding_crf").value);
     fd.append("remove_silence", $("remove_silence").checked ? "on" : "off");
     if (mode === "translate") fd.append("api_key", $("api_key").value.trim());
+    fd.append("llm_model", resolveLLMModel());
 
     startBtn.disabled = true;
     setupCard.style.opacity = ".6";

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -40,6 +41,48 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 # MIME overrides for browsers that choke on uncommon types
 MIME_OVERRIDES = {".js": "text/javascript", ".mjs": "text/javascript"}
+
+
+# ── options builder (shared by /api/process) ─────────────────────────────
+def build_options(form: dict) -> dict:
+    """Translate the upload form fields into the pipeline options dict."""
+    return {
+        "model": form.get("model", "tiny"),
+        # Normalize 'auto'/'none' -> None so faster-whisper auto-detects
+        # the language (it rejects the literal string 'auto').
+        "lang": (None if str(form.get("lang", "auto")).strip().lower()
+                 in ("auto", "none", "") else form.get("lang", "auto")),
+        "min": int(form.get("min", 15)),
+        "max": int(form.get("max", 60)),
+        "max_clips": int(form.get("max_clips", 28)),
+        "min_score": int(form.get("min_score", 55)),
+        "device": form.get("device", "auto"),
+        "compute_type": form.get("compute_type", "auto"),
+        "vad_min_silence": int(form.get("vad_min_silence", 400)),
+        "vad_speech_pad": int(form.get("vad_speech_pad", 200)),
+        "batch": int(form.get("batch", 16)),
+        "chunk_duration": float(form.get("chunk_duration", 360.0)),
+        "chunk_overlap": float(form.get("chunk_overlap", 60.0)),
+        "subtitles": form.get("subtitles", "on") == "on",
+        "subtitle_position": form.get("subtitle_position", "lower"),
+        "subtitle_font_size_pct": form.get("subtitle_font_size_pct", ""),
+        "title": form.get("title", "off") == "on",
+        "orientation": form.get("orientation", "auto"),
+        "crop": form.get("crop", "off") == "on",
+        "split_screen": form.get("split_screen", "off") == "on",
+        "active_speaker": form.get("active_speaker", "on") == "on",
+        "remove_silence": form.get("remove_silence", "off") == "on",
+        "max_silence": float(form.get("max_silence", 1.5)),
+        "cta": form.get("cta", "off") == "on",
+        "target_language": form.get("target_language", "en") or "en",
+        "encoding_preset": form.get("encoding_preset", "veryfast"),
+        "encoding_crf": int(form.get("encoding_crf", 23)),
+        "output_dir": str(ROOT / "clips"),
+        "video_name": form.get("video_name", ""),
+        "llm_model": form.get("llm_model") or None,
+        "api_key": form.get("api_key") or None,
+        "system_prompt": form.get("system_prompt") or None,
+    }
 
 
 # ── multipart upload (stdlib, no external deps) ───────────────────────────
@@ -112,7 +155,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"prompt": SYSTEM_PROMPT})
 
         if path.startswith("/api/job/"):
-            job_id = path.split("/")[-1]
+            # urlparse does NOT percent-decode, so a job id derived from a
+            # filename with spaces arrives as "…V1%20.mp4"; decode it before
+            # the dict lookup or get_job() never matches (dashboard hangs).
+            job_id = urllib.parse.unquote(path.split("/")[-1])
             job = get_job(job_id)
             if not job:
                 return self._send_json({"error": "job not found"}, 404)
@@ -128,6 +174,7 @@ class Handler(BaseHTTPRequestHandler):
             # /files/<job_id>/<filename>  -> stream the output clip
             _, _, rest = path.partition("/files/")
             job_id, _, fname = rest.partition("/")
+            job_id = urllib.parse.unquote(job_id)
             job = get_job(job_id)
             if not job or not job.output_dir:
                 return self._send_json({"error": "not found"}, 404)
@@ -136,6 +183,15 @@ class Handler(BaseHTTPRequestHandler):
                     str(Path(job.output_dir).resolve())):
                 return self._send_json({"error": "file not found"}, 404)
             return self._serve_file_stream(fpath)
+
+        if path.startswith("/api/download-all/"):
+            # /api/download-all/<job_id>  -> zip every file in the job's
+            # output folder and stream it as one archive.
+            job_id = urllib.parse.unquote(path.split("/")[-1])
+            job = get_job(job_id)
+            if not job or not job.output_dir:
+                return self._send_json({"error": "not found"}, 404)
+            return self._serve_zip(job)
 
         # static assets under dashboard/
         if path.startswith("/dashboard/"):
@@ -160,7 +216,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/clear-cache/"):
             parts = path.split("/")
             # ["", "api", "clear-cache", "<job_id>", ("<step>")?]
-            job_id = parts[3] if len(parts) > 3 else ""
+            job_id = urllib.parse.unquote(parts[3]) if len(parts) > 3 else ""
             step = parts[4] if len(parts) > 4 else None
             from sosmed.web_runner import clear_job_cache
             n = clear_job_cache(job_id, step)
@@ -173,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # ── RETRY: re-run a previous job's same upload with relaxed params ──
         if path.startswith("/api/retry/"):
-            job_id = path.split("/")[-1]
+            job_id = urllib.parse.unquote(path.split("/")[-1])
             old = get_job(job_id)
             if not old:
                 return self._send_json({"error": "job not found"}, 404)
@@ -195,6 +251,39 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self._send_json(
                     {"error": "original upload no longer available"}, 410)
+            return self._send_json({"job_id": job.id, "state": job.to_dict()})
+
+        # ── MOCK PREVIEW: render a sample clip with the REAL overlay code ──
+        # Lets you verify the dashboard (title / subtitle / position / topic)
+        # WITHOUT running the full pipeline. POST /api/mock (JSON or form ok).
+        if path == "/api/mock":
+            from sosmed.mock import build_mock_job
+            mock_opts: dict = {}
+            if self.headers.get("Content-Type", "").startswith("application/json"):
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    if length:
+                        mock_opts = json.loads(self.rfile.read(length)) or {}
+                except Exception:
+                    mock_opts = {}
+            else:
+                length = int(self.headers.get("Content-Length", 0))
+                if length:
+                    try:
+                        _, form = parse_multipart(self.rfile.read(length),
+                                                  self.headers.get("Content-Type", "")
+                                                  .split("boundary=")[-1].strip().strip('"'))
+                        mock_opts = dict(form)
+                    except Exception:
+                        mock_opts = {}
+            # Only the render-affecting options are honoured for the preview.
+            job = build_mock_job({
+                "orientation": mock_opts.get("orientation", "auto"),
+                "subtitles": str(mock_opts.get("subtitles", "on")) == "on",
+                "title": str(mock_opts.get("title", "off")) == "on",
+                "subtitle_position": mock_opts.get("subtitle_position", "lower"),
+                "subtitle_font_size_pct": mock_opts.get("subtitle_font_size_pct", ""),
+            })
             return self._send_json({"job_id": job.id, "state": job.to_dict()})
 
         if path != "/api/process":
@@ -242,42 +331,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"error": "no video file in upload"}, 400)
 
         # build options from form
-        options = {
-            "model": form.get("model", "tiny"),
-            # Normalize 'auto'/'none' -> None so faster-whisper auto-detects
-            # the language (it rejects the literal string 'auto').
-            "lang": (None if str(form.get("lang", "auto")).strip().lower()
-                     in ("auto", "none", "") else form.get("lang", "auto")),
-            "min": int(form.get("min", 15)),
-            "max": int(form.get("max", 60)),
-            "max_clips": int(form.get("max_clips", 10)),
-            "min_score": int(form.get("min_score", 55)),
-            "device": form.get("device", "auto"),
-            "compute_type": form.get("compute_type", "auto"),
-            "vad_min_silence": int(form.get("vad_min_silence", 400)),
-            "vad_speech_pad": int(form.get("vad_speech_pad", 200)),
-            "batch": int(form.get("batch", 16)),
-            "chunk_duration": float(form.get("chunk_duration", 360.0)),
-            "chunk_overlap": float(form.get("chunk_overlap", 60.0)),
-            "subtitles": form.get("subtitles", "on") == "on",
-            "subtitle_position": form.get("subtitle_position", "lower"),
-            "title": form.get("title", "off") == "on",
-            "orientation": form.get("orientation", "auto"),
-            "crop": form.get("crop", "off") == "on",
-            "split_screen": form.get("split_screen", "off") == "on",
-            "active_speaker": form.get("active_speaker", "on") == "on",
-            "remove_silence": form.get("remove_silence", "off") == "on",
-            "max_silence": float(form.get("max_silence", 1.5)),
-            "cta": form.get("cta", "off") == "on",
-            "target_language": form.get("target_language", "en") or "en",
-            "encoding_preset": form.get("encoding_preset", "veryfast"),
-            "encoding_crf": int(form.get("encoding_crf", 23)),
-            "output_dir": str(ROOT / "clips"),
-            "video_name": orig_stem,
-            "llm_model": form.get("llm_model") or None,
-            "api_key": form.get("api_key") or None,
-            "system_prompt": form.get("system_prompt") or None,
-        }
+        options = build_options(form)
+        options["video_name"] = orig_stem
 
         job = run_job(str(dest), options)
         with _jobs_lock:
@@ -321,6 +376,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_zip(self, job):
+        """Stream a zip of every file in the job's output folder."""
+        import io
+        out_dir = Path(job.output_dir)
+        files = sorted(p for p in out_dir.iterdir()
+                       if p.is_file() and not p.name.endswith(".zip"))
+        if not files:
+            return self._send_json({"error": "no output files to zip"}, 404)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.write(f, arcname=f.name)
+        data = buf.getvalue()
+        safe_id = re.sub(r"[^A-Za-z0-9._-]", "_", job.id)
+        fname = f"clips_{safe_id}.zip"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{fname}"')
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)

@@ -31,10 +31,8 @@ CACHEABLE_STEPS = [
     "transcribe",   # transcript segments (already cached elsewhere, kept for status)
     "prefilter",
     "energy",
-    "llm_select",
-    "refine",
-    "extract",
-    "render",
+    "select_refine",
+    "build",
 ]
 
 

@@ -41,7 +41,7 @@ def generate_single_clip_metadata(
     user_title = str(clip.get("title", "") or "").strip()
     user_caption = str(clip.get("caption", "") or "").strip()
 
-    for field in ["title", "topic", "caption", "reason", "hook", "closing_line", "comment_bait"]:
+    for field in ["title", "topic", "caption", "reason", "hook", "closing_line", "comment_bait", "social_description"]:
         # Skip if user already provided this field
         if field == "title" and user_title:
             continue
@@ -85,6 +85,154 @@ def _target_label(target_language: str) -> str:
     return t  # open language: used verbatim in the prompt
 
 
+def _call_llm_clips(
+    prompt_text: str,
+    system_message: str,
+    clips: list[dict[str, Any]],
+    llm_model: str | None,
+    api_key: str | None,
+    max_retries: int = 2,
+) -> list[dict[str, Any]] | None:
+    """
+    Serialize ``clips`` to JSON, call the LLM once, and return the parsed clip
+    list (or ``None`` on total failure, so the caller can keep the originals).
+
+    Centralizes the retry / malformed-response handling that the old three-step
+    pipeline duplicated for every pass.
+    """
+    if not clips:
+        return None
+
+    clips_json = json.dumps(clips, ensure_ascii=False, indent=2)
+    user_message = f"{prompt_text}\n\nClips:\n{clips_json}"
+
+    result: list[dict[str, Any]] | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            raw_result = call_llm(system_message, user_message, api_key, llm_model)
+            if raw_result and isinstance(raw_result, list) and all(isinstance(c, dict) for c in raw_result):
+                result = raw_result
+                break
+            else:
+                log("WARN", f"Refine attempt {attempt + 1}/{max_retries + 1}: "
+                             f"malformed response, retrying...")
+        except Exception as e:
+            log("WARN", f"Refine attempt {attempt + 1}/{max_retries + 1}: {e}, retrying...")
+    return result
+
+
+def _merge_refined_clips(
+    clips: list[dict[str, Any]],
+    result: list[dict[str, Any]],
+    fields: tuple[str, ...] = ("title", "topic", "caption", "hook", "reason", "closing_line", "social_description"),
+) -> list[dict[str, Any]]:
+    """
+    Merge LLM-refined fields back into the original clips by (start, end) key.
+
+    Preserves every original metadata/timing field and only overwrites the
+    listed content fields with the model's output. Clips the LLM dropped (it may
+    have deduplicated) are re-introduced from ``clips`` (copy + merged fields) so
+    no clip is silently lost, then re-ranked by score — matching the previous
+    per-step behaviour exactly.
+    """
+    if not result:
+        return clips
+
+    orig_map = {
+        (round(c.get("start", 0), 2), round(c.get("end", 0), 2)): c
+        for c in clips
+    }
+    merged: list[dict[str, Any]] = []
+    for improved in result:
+        key = (round(improved.get("start", 0), 2), round(improved.get("end", 0), 2))
+        if key in orig_map:
+            m = orig_map[key].copy()
+            for f in fields:
+                if f in improved and str(improved[f] or "").strip():
+                    m[f] = improved[f]
+            merged.append(m)
+            orig_map.pop(key, None)  # consume so we don't double-add below
+        else:
+            # LLM produced a clip not in originals — keep as-is (e.g. new merge).
+            merged.append(improved)
+
+    # Any original clip the LLM dropped gets re-added unchanged (no silent loss).
+    for c in orig_map.values():
+        merged.append(c.copy())
+
+    merged.sort(key=lambda x: (-x.get("clip_score", 0), x.get("rank", 999)))
+    for i, c in enumerate(merged, 1):
+        c["rank"] = i
+    return merged
+
+
+def _refine_clips_combined(
+    clips: list[dict[str, Any]],
+    llm_model: str | None = None,
+    api_key: str | None = None,
+    detected_language: dict[str, Any] | None = None,
+    target_language: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Single-pass replacement for the old 3-step pipeline (translate → fix
+    caption/topic → improve+dedupe). One LLM call now does all three, which
+    roughly triples the speed of the ``refine`` step because the LLM was the
+    only real cost and it was being billed three times in series.
+
+    Falls back to returning the original clips (no mutation) if the single call
+    fails entirely — the previous behaviour on a failed step.
+    """
+    if not clips:
+        return clips
+
+    target = _normalize_target_language(target_language)
+    log("INFO", f"Refining {len(clips)} clips in one LLM pass (target language: {target})")
+
+    # Pick the prompt that encodes translate + fix + improve for the language mode.
+    if target == "auto":
+        prompt_text = _read_prompt("Refine Clips (No Translate)")
+        system_message = (
+            "You are an expert social media strategist. Optimize strictly for "
+            "virality first (shares/comments/replays), not completeness. Keep the "
+            "original language."
+        )
+    elif target.lower().startswith("en"):
+        # Skip translation when Whisper already detected English with high confidence.
+        skip_translate = False
+        if detected_language:
+            lang = detected_language.get("language", "").lower()
+            prob = detected_language.get("language_probability", 0.0)
+            if lang == "en" and prob > 0.6:
+                skip_translate = True
+        prompt_key = (
+            "Improve and Deduplicate Clips"
+            if skip_translate
+            else "Refine Clips (Translate to English)"
+        )
+        prompt_text = _read_prompt(prompt_key)
+        system_message = (
+            "You are an expert social media strategist. Optimize strictly for "
+            "virality first (shares/comments/replays), not completeness or neutral "
+            "informativeness."
+        )
+    else:
+        label = _target_label(target)
+        prompt_text = _read_prompt("Refine Clips (Translate to Target Language)", label)
+        system_message = (
+            "You are an expert social media strategist and translator. Optimize "
+            "strictly for virality first (shares/comments/replays), not completeness."
+        )
+
+    result = _call_llm_clips(prompt_text, system_message, clips, llm_model, api_key)
+    if not result:
+        log("WARN", "Combined refine call failed after retries; keeping original clips unchanged")
+        return clips
+
+    merged = _merge_refined_clips(clips, result)
+    log("OK", f"After combined refine: {len(merged)} clips")
+    return merged
+
+
 def fix_and_improve_clips(
     clips: list[dict[str, Any]],
     llm_model: str | None = None,
@@ -101,6 +249,11 @@ def fix_and_improve_clips(
 
     This runs AFTER find_clips() and BEFORE subtitle generation.
 
+    The three operations are now performed in a SINGLE LLM pass
+    (``_refine_clips_combined``) instead of three sequential calls, which makes
+    the ``refine`` step ~3x faster. The original per-step helpers still exist
+    for callers that need them (e.g. ``process_single`` uses ``_translate_to_language``).
+
     Args:
         detected_language: dict with keys "language" and "language_probability" from Whisper
         target_language: "en" (default), "id", "auto" (keep original), or any open
@@ -110,35 +263,13 @@ def fix_and_improve_clips(
         log("WARN", "No clips to fix")
         return clips
 
-    target = _normalize_target_language(target_language)
-    log("INFO", f"Starting clip fixing pipeline: {len(clips)} clips "
-                f"(target language: {target})")
-
-    # Step 1: Translate to target language (skip entirely when "auto")
-    if target == "auto":
-        log("INFO", "Step 1/3: Keeping original language (auto) — skipping translation")
-    else:
-        label = _target_label(target)
-        log("INFO", f"Step 1/3: Translating to {label}...")
-        clips = _translate_to_language(clips, label, llm_model, api_key, detected_language)
-        log("OK", f"After translation: {len(clips)} clips")
-
-    # Step 2: Fix mismatched caption/topic
-    log("INFO", "Step 2/3: Fixing mismatched caption/topic pairs...")
-    clips = _fix_caption_topic_mismatch(clips, llm_model, api_key)
-    log("OK", f"After fixing mismatches: {len(clips)} clips")
-
-    # Step 3: Improve and deduplicate
-    log("INFO", "Step 3/3: Improving content and deduplicating topics...")
-    clips = _improve_and_deduplicate(clips, llm_model, api_key)
-    log("OK", f"After improvement and deduplication: {len(clips)} clips")
-
-    # Re-rank by score
-    clips.sort(key=lambda x: (-x.get("clip_score", 0), x.get("rank", 999)))
-    for i, c in enumerate(clips, 1):
-        c["rank"] = i
-
-    return clips
+    return _refine_clips_combined(
+        clips,
+        llm_model=llm_model,
+        api_key=api_key,
+        detected_language=detected_language,
+        target_language=target_language,
+    )
 
 
 def _translate_to_language(
@@ -214,7 +345,7 @@ def _translate_to_language(
         if key in result_map:
             trans_clip = result_map[key]
             # Update translatable fields
-            for field in ["title", "topic", "caption", "hook"]:
+            for field in ["title", "topic", "caption", "hook", "social_description"]:
                 if field in trans_clip:
                     orig_clip[field] = trans_clip[field]
             matched_count += 1
@@ -325,7 +456,7 @@ def _improve_and_deduplicate(
             orig = orig_map[key]
             # Merge: keep all original fields, update with improved content fields
             merged = orig.copy()
-            for field in ["title", "topic", "caption", "hook"]:
+            for field in ["title", "topic", "caption", "hook", "social_description"]:
                 if field in improved_clip:
                     merged[field] = improved_clip[field]
             deduplicated.append(merged)
@@ -339,6 +470,85 @@ def _improve_and_deduplicate(
         c["rank"] = i
 
     return deduplicated
+
+
+def _redistribute_with_gaps(
+    words: list[dict],
+    trans_texts: list[str],
+    phrase_start: float,
+    phrase_end: float,
+) -> list[dict]:
+    """Map translated words onto the *real* speech gaps of a source phrase.
+
+    The naive redistribution (``phrase_duration / N`` even slices) smears the
+    spoken audio across the natural pauses between words: a translated word that
+    was actually said after a 0.8s silence shows up ~0.24s early, so the burnt
+    caption visibly drifts ahead of the speaker and the speech looks "gap-free".
+    This keeps the source's inter-word gaps intact and only redistributes the
+    *talking* time, so subtitle timing tracks the speech.
+
+    Args:
+        words: source phrase words ``[{word, start, end}]`` (clip-relative).
+        trans_texts: already-split translated word strings.
+        phrase_start / phrase_end: clip-relative phrase bounds (== words[0].start
+            and words[-1].end after translation grouping).
+
+    Returns translated-word dicts with ``start``/``end`` aligned to the source's
+    talk/gap structure (clip-relative, preserving inter-word silences).
+    """
+    n_src = len(words)
+    n_dst = len(trans_texts)
+    if n_src == 0 or n_dst == 0:
+        return []
+
+    src_starts = [float(w["start"]) for w in words]
+    src_ends = [float(w["end"]) for w in words]
+    talk = [src_ends[i] - src_starts[i] for i in range(n_src)]
+    # Gap that FOLLOWS source word i (between word i and i+1).
+    gaps = [src_starts[i + 1] - src_ends[i] for i in range(n_src - 1)]
+
+    # 1:1 word count — reuse the exact spoken timing; gaps preserved perfectly.
+    if n_dst == n_src:
+        return [
+            {"word": trans_texts[j], "start": src_starts[j], "end": src_ends[j]}
+            for j in range(n_dst)
+        ]
+
+    total_talk = sum(talk)
+    total_gap = sum(gaps)
+
+    # Talk time shared evenly across translated words.  When the translator
+    # merges/splits words there is no word→word mapping, so an even share of
+    # the *talk* span is the safe default (and correct when words were merely
+    # collapsed/expanded).  The inter-word silences below are preserved exactly.
+    talk_per = total_talk / n_dst
+
+    # Spread the source gaps across the (n_dst - 1) boundaries *between*
+    # translated words, in source order so the relative pauses survive.
+    boundary_gap: list[float] = [0.0] * max(1, n_dst - 1)
+    n_src_gaps = len(gaps)
+    for k, g in enumerate(gaps):
+        if n_dst - 1 >= n_src_gaps:
+            b = k
+        elif n_src_gaps > 1:
+            b = min(n_dst - 2, int(round(k * (n_dst - 2) / (n_src_gaps - 1))))
+        else:
+            b = 0
+        boundary_gap[b] += g
+
+    out: list[dict] = []
+    cursor = phrase_start
+    for j in range(n_dst):
+        s = cursor
+        e = cursor + talk_per
+        out.append({"word": trans_texts[j], "start": s, "end": e})
+        cursor = e
+        if j < n_dst - 1:
+            # Don't overrun the phrase window on rounding drift.
+            remaining = phrase_end - cursor
+            if remaining > 0:
+                cursor += min(boundary_gap[j], remaining)
+    return out
 
 
 def translate_subtitle_words(
@@ -464,62 +674,90 @@ def translate_subtitle_words(
     # ── 2b. Call the LLM in chunks ──────────────────────────────────────────
     # A single merged call for long videos emits 600+ phrase objects; the
     # model's JSON output then hits the ``max_tokens`` ceiling and the tail
-    # phrases (highest ids) get truncated — they silently fell through to
-    # "keep original", shipping mixed-language subtitles (see the per-phrase
-    # warning below). Capping phrases-per-call keeps each response well under
-    # the 8192 output-token ceiling used in backends.openrouter (~35 tokens per
-    # phrase worst case → 200 leaves ample headroom). The per-phrase ``id`` is
+    # phrases (highest ids) get truncated. Capping phrases-per-call keeps each
+    # response under the model's real output ceiling. The per-phrase ``id`` is
     # preserved across chunks so the redistribution map below still lines up.
-    MAX_PHRASES_PER_CALL = 200
+    #
+    # CALIBRATION: the observed free-tier model (laguna-xs) truncated a 127-
+    # phrase payload. 200 was far too high. 80 leaves comfortable headroom for
+    # ~35 tokens/phrase worst case AND for the retries below to finish in 1-2
+    # passes even when the model is being terse.
+    MAX_PHRASES_PER_CALL = 80
 
     id_to_text: dict[int, str] = {}
-    n_chunks = (len(phrases) + MAX_PHRASES_PER_CALL - 1) // MAX_PHRASES_PER_CALL
-    for c_start in range(0, len(phrases), MAX_PHRASES_PER_CALL):
-        chunk = phrases[c_start:c_start + MAX_PHRASES_PER_CALL]
-        chunk_idx = c_start // MAX_PHRASES_PER_CALL + 1
 
-        phrases_json = json.dumps(chunk, ensure_ascii=False, indent=2)
+    def _process_batch(batch: list[dict], batch_label: str) -> tuple[dict[int, str], set[int]]:
+        """Translate one batch of phrases. Returns (id->text map, uncovered ids).
+
+        On truncation we retry ONLY the still-uncovered phrases, looping until
+        everything is covered or the batch shrinks below a floor we give up on.
+        Crucially we never re-send a payload that still exceeds what the model
+        can emit: each retry drops the phrases it *did* get, so an oversized
+        tail monotonically shrinks and eventually fits (capping attempts avoids
+        an infinite loop on a genuinely broken model)."""
+        phrases_json = json.dumps(batch, ensure_ascii=False, indent=2)
         user_message = f"{prompt_text}\n\nPhrases to translate:\n{phrases_json}"
 
-        # Call LLM with retry (per chunk)
-        max_retries = 2
-        result = None
-        for attempt in range(max_retries + 1):
+        cmap: dict[int, str] = {}
+        pending = list(batch)
+        attempts = 0
+        MAX_ATTEMPTS = 8  # generous; normally 1-2 loops resolve truncation
+        while pending and attempts < MAX_ATTEMPTS:
+            attempts += 1
+            result = None
             try:
                 raw_result = call_llm(system_message, user_message, api_key, llm_model)
                 if raw_result and isinstance(raw_result, list) and all(isinstance(p, dict) for p in raw_result):
                     result = raw_result
-                    break
                 else:
-                    log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1} "
-                                 f"(chunk {chunk_idx}/{n_chunks}): malformed response, retrying...")
+                    log("WARN", f"Subtitle translation (batch {batch_label}): malformed response, retrying...")
             except Exception as e:
-                log("WARN", f"Subtitle translation attempt {attempt + 1}/{max_retries + 1} "
-                             f"(chunk {chunk_idx}/{n_chunks}): {e}, retrying...")
+                log("WARN", f"Subtitle translation (batch {batch_label}): {e}, retrying...")
 
-        if not result:
-            # Chunk failed entirely. Leave its phrases unmapped so they fall
-            # through to the per-phrase "keep original" path and get logged —
-            # better than dropping them silently, per project no-fallback rule.
-            log("WARN", f"Subtitle translation chunk {chunk_idx}/{n_chunks} failed after "
-                        f"retries; {len(chunk)} phrases will keep original text")
-            continue
+            if result:
+                for item in result:
+                    pid = item.get("id")
+                    text = item.get("text", "").strip()
+                    if pid is None or not text:
+                        continue
+                    unk_ratio = text.count("<unk>") / max(1, len(text.split()))
+                    if unk_ratio > 0.2 or len(text) < 2:
+                        log("WARN", f"Subtitle phrase id={pid} returned degenerate output "
+                                     f"(unk_ratio={unk_ratio:.2f}); keeping original words")
+                        continue
+                    cmap[int(pid)] = text
 
-        # Merge this chunk's id→translated_text into the global map
-        for item in result:
-            pid = item.get("id")
-            text = item.get("text", "").strip()
-            if pid is not None and text:
-                # Guardrail: free-tier models occasionally return <unk> garbage or
-                # near-empty strings. Rejecting them here falls through to the
-                # per-phrase "keep original" fallback instead of burning the clip
-                # with nonsense subtitles (and wasting ~10 min regenerating).
-                unk_ratio = text.count("<unk>") / max(1, len(text.split()))
-                if unk_ratio > 0.2 or len(text) < 2:
-                    log("WARN", f"Subtitle phrase id={pid} returned degenerate output "
-                                 f"(unk_ratio={unk_ratio:.2f}); keeping original words")
-                    continue
-                id_to_text[int(pid)] = text
+            requested = {int(p["id"]) for p in pending}
+            covered = set(cmap.keys())
+            uncovered = requested - covered
+            if not uncovered:
+                break
+
+            # Drop the phrases we already got and re-request the rest. Because
+            # the pending set shrinks each pass, an over-long tail eventually
+            # fits the model's output window.
+            pending = [p for p in pending if int(p["id"]) in uncovered]
+            phrases_json = json.dumps(pending, ensure_ascii=False, indent=2)
+            user_message = f"{prompt_text}\n\nPhrases to translate:\n{phrases_json}"
+            log("WARN", f"Subtitle batch {batch_label}: {len(uncovered)} phrase(s) "
+                         f"truncated (id {sorted(uncovered)[:5]}{'…' if len(uncovered) > 5 else ''}); "
+                         f"retrying {len(pending)} remaining (attempt {attempts})…")
+
+        if pending:
+            # Genuinely failed after retries — per the no-fallback rule, leave
+            # these unmapped so they fall through to "keep original" and get
+            # logged individually below (one warning per phrase), not silently.
+            ids_left = {int(p["id"]) for p in pending}
+            log("WARN", f"Subtitle batch {batch_label}: {len(ids_left)} phrase(s) "
+                         f"still untranslated after {attempts} attempts; keeping original text")
+        return cmap, {int(p["id"]) for p in pending}
+
+    n_chunks = (len(phrases) + MAX_PHRASES_PER_CALL - 1) // MAX_PHRASES_PER_CALL
+    for c_start in range(0, len(phrases), MAX_PHRASES_PER_CALL):
+        chunk = phrases[c_start:c_start + MAX_PHRASES_PER_CALL]
+        chunk_idx = c_start // MAX_PHRASES_PER_CALL + 1
+        cmap, _ = _process_batch(chunk, f"{chunk_idx}/{n_chunks}")
+        id_to_text.update(cmap)
 
     # ── 3. Redistribute timestamps for translated words ──────────────────────
     translated_words: list[dict] = []
@@ -532,7 +770,6 @@ def translate_subtitle_words(
         pid = phrases[i].get("id")
         phrase_start = grp[0]["start"]
         phrase_end = grp[-1]["end"]
-        phrase_duration = phrase_end - phrase_start
 
         translated_text = id_to_text.get(pid) if pid is not None else None
         if not translated_text:
@@ -549,12 +786,15 @@ def translate_subtitle_words(
                 translated_words.append(w.copy())
             continue
 
-        word_dur = phrase_duration / len(trans_words)
-        for j, tw in enumerate(trans_words):
+        # Redistribute onto the *real* inter-word gaps instead of a flat even
+        # slice.  This keeps the natural pauses between words so the burnt
+        # caption tracks the speech instead of smearing it across silences
+        # (the "subtitles run ahead of the speaker" symptom).
+        for twd in _redistribute_with_gaps(grp, trans_words, phrase_start, phrase_end):
             translated_words.append({
-                "word": tw,
-                "start": phrase_start + j * word_dur,
-                "end": phrase_start + (j + 1) * word_dur,
+                "word": twd["word"],
+                "start": twd["start"],
+                "end": twd["end"],
                 "_pid": pid,  # transient: marks source phrase for batch remap
             })
 

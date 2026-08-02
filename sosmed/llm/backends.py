@@ -98,10 +98,52 @@ def _retry_on_rate_limit(
                 return ""
 
 
-def _parse_llm_json(raw: str) -> tuple[list[dict[str, Any]], bool]:
+# Leading content-safety classification headers emitted by some models
+# (e.g. NVIDIA Nemotron) before their actual payload, e.g.:
+#   User Safety: safe
+#   Response Safety: safe
+#   Safety Categories: Violence, Criminal Planning/Confessions
+# These precede the JSON and break parsing; we strip them so the downstream
+# balanced-array extraction can pick up the real payload.
+_SAFETY_HEADER_LINE = re.compile(
+    r"^\s*(?:user|response|prompt)?\s*safety\s*:\s*\S.*$",
+    re.IGNORECASE,
+)
+_SAFETY_CATEGORIES_LINE = re.compile(
+    r"^\s*safety\s+categories\s*:\s*\S.*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_safety_header(text: str) -> str:
+    """
+    Remove leading content-safety classification lines from model output.
+
+    Such lines appear only as a prefix (Nemotron-style) and are always
+    followed by the real answer on a later line, so dropping them from the
+    top of the text is safe.
+    """
+    lines = text.splitlines()
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        if _SAFETY_HEADER_LINE.match(stripped) or _SAFETY_CATEGORIES_LINE.match(stripped):
+            idx += 1
+        else:
+            break
+    return "\n".join(lines[idx:]).strip()
+
+
+def _parse_llm_json(raw: str, silent: bool = False) -> tuple[list[dict[str, Any]], bool]:
     """
     Robustly extract a JSON array from LLM text.
-    
+
+    Args:
+        raw: Raw model output text.
+        silent: When True, suppress the "Recovered N clip(s)" warning. Used by
+            internal probes that only need to know whether the text parses, so
+            the warning is not double-logged.
+
     Returns:
         (parsed_data, success) — success=False if parsing failed
     """
@@ -110,6 +152,10 @@ def _parse_llm_json(raw: str) -> tuple[list[dict[str, Any]], bool]:
 
     # Strip markdown code fences.
     cleaned = re.sub(r"```(?:json)?", "", cleaned).strip().rstrip("`").strip()
+
+    # Strip leading content-safety classification header (Nemotron-style),
+    # which would otherwise prevent JSON parsing.
+    cleaned = _strip_safety_header(cleaned)
 
     def _extract_balanced_array(text: str) -> str | None:
         """
@@ -208,7 +254,8 @@ def _parse_llm_json(raw: str) -> tuple[list[dict[str, Any]], bool]:
     # Last resort 2: salvage leading valid objects from a possibly truncated array.
     partial = _parse_partial_array(cleaned)
     if partial:
-        log("WARN", f"Recovered {len(partial)} clip(s) from partial JSON array output")
+        if not silent:
+            log("WARN", f"Recovered {len(partial)} clip(s) from partial JSON array output")
         return partial, True
 
     return [], False
@@ -248,7 +295,16 @@ def _retry_on_json_failure(
         
         if success:
             return clips
-        
+
+        # If the model returned no JSON-like content at all (e.g. a content-
+        # safety refusal that was only a "User Safety: safe" header, or a
+        # truly empty response), retrying with the same prompt will not
+        # conjure a JSON array — stop early to avoid a pointless, slow call.
+        if "[" not in raw and "{" not in raw:
+            log("ERROR", "LLM returned no JSON payload (likely a content-safety refusal or empty response).")
+            log("ERROR", f"Raw output: {raw[:500]}")
+            return []
+
         if attempt < max_attempts - 1:
             log("WARN", f"JSON parse failed (attempt {attempt + 1}), retrying with modified prompt...")
             log("DEBUG", f"Raw output that failed to parse: {raw[:500]}...")
@@ -329,7 +385,7 @@ def openrouter(
         def api_call() -> str:
             kwargs: dict[str, Any] = dict(
                 model=model,
-                max_tokens=16000 if reasoning else 8192,
+                max_tokens=16000,
                 # Reasoning models require temperature=1; use 0.3 otherwise.
                 temperature=1 if reasoning else 0.3,
                 messages=[
@@ -364,7 +420,7 @@ def openrouter(
             # vice-versa.  We pick whichever field contains parseable JSON;
             # if both are non-empty we prefer content (the intended answer).
             if content:
-                _, content_ok = _parse_llm_json(content)
+                _, content_ok = _parse_llm_json(content, silent=True)
             else:
                 content_ok = False
 
@@ -488,9 +544,19 @@ def call_llm(
     or_key = api_key or os.getenv("OPENROUTER_API_KEY")
 
     if or_key:
-        # Priority: explicit param → env var → config → default
+        # Priority: explicit dashboard/CLI param → config file → .env → built-in default.
+        # The .env OPENROUTER_MODEL is deliberately LAST: it must never override the
+        # model chosen in the dashboard (passed as llm_model) or set in config.yaml.
+        # Historically it sat above the config, so a stale .env value clobbered the
+        # dashboard selection on any call where llm_model was None (e.g. truncation
+        # retries), producing an inconsistent mix of models per run.
         or_settings = get_openrouter_settings()
-        model = llm_model or os.getenv("OPENROUTER_MODEL") or or_settings.get("model", DEFAULT_OPENROUTER_MODEL)
+        model = (
+            llm_model
+            or or_settings.get("model")
+            or os.getenv("OPENROUTER_MODEL")
+            or DEFAULT_OPENROUTER_MODEL
+        )
         base_url = or_settings.get("base_url", DEFAULT_OPENROUTER_BASE)
         return openrouter(system, user, or_key, model=model, base_url=base_url, enable_reasoning=enable_reasoning)
     else:

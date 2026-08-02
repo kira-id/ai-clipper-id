@@ -165,6 +165,7 @@ def _postprocess_one(
     subtitles: bool = True,
     subtitle_position: str = "lower",
     subtitle_margin_pct: float | None = None,
+    subtitle_font_size_pct: float | None = None,
     enable_title: bool = False,
     orientation: str = "auto",
     enable_crop: bool = False,
@@ -350,6 +351,7 @@ def _postprocess_one(
                 play_res_y=out_h,
                 position=subtitle_position,
                 subtitle_margin_pct=subtitle_margin_pct,
+                font_size_pct=subtitle_font_size_pct if subtitle_font_size_pct is not None else 3.2,
             )
             tmp = tempfile.NamedTemporaryFile(
                 suffix=".ass", prefix="sosmed_sub_",
@@ -592,6 +594,7 @@ def postprocess_clips(
     subtitles: bool = True,
     subtitle_position: str = "lower",
     subtitle_margin_pct: float | None = None,
+    subtitle_font_size_pct: float | None = None,
     enable_title: bool = False,
     orientation: str = "auto",
     enable_crop: bool = False,
@@ -675,6 +678,7 @@ def postprocess_clips(
                 subtitles=subtitles,
                 subtitle_position=subtitle_position,
                 subtitle_margin_pct=subtitle_margin_pct,
+                subtitle_font_size_pct=subtitle_font_size_pct,
                 enable_title=enable_title,
                 orientation=orientation,
                 enable_crop=enable_crop,
@@ -717,3 +721,142 @@ def postprocess_clips(
                     f"and were dropped: {' | '.join(failures[:3])}")
 
     return sorted(results)
+
+
+# ── Single-video single-pass render ──────────────────────────────────────────
+# The single-video ("subtitles for one video") dashboard used to run the *full*
+# clip pipeline on a single clip spanning the whole video: extract_clips re-encodes
+# the entire source (4K, ~7 min for a 21-min video) to produce a raw clip, then
+# postprocess_clips re-encodes that raw clip AGAIN to burn subtitles + loudnorm.
+# Two full-resolution transcodes of the same content — the main reason long videos
+# take so long, and the reason a concurrent run clobbered a 7-minute in-progress
+# write into a corrupt MP4.
+#
+# render_single_video collapses that into ONE ffmpeg pass straight from the
+# source: seek -> decode -> ass(subtitles) -> loudnorm(audio) -> encode.
+# No intermediate raw file is written, halving both wall time and disk churn.
+def render_single_video(
+    video_path: str,
+    output_path: str,
+    subtitle_words: list[dict[str, Any]] | None = None,
+    *,
+    subtitle_position: str = "lower",
+    subtitle_margin_pct: float | None = None,
+    subtitle_font_size_pct: float | None = None,
+    start: float = 0.0,
+    end: float | None = None,
+    encoding_preset: str | None = None,
+    encoding_crf: int | None = None,
+    use_hwaccel: bool = True,
+) -> str:
+    """Render a subtitled, loudnorm'd copy of ``video_path`` in a single pass.
+
+    The source is decoded once and the final MP4 is written directly to
+    ``output_path`` — no intermediate raw clip is produced. Uses the exact same
+    ASS generator (``generate_ass_subtitles``) and `_escape_ass_path` as the
+    multi-clip pipeline, so burnt subtitles look identical across modes.
+
+    Returns ``output_path`` on success; raises RuntimeError on failure.
+    """
+    defaults = get_defaults()
+    if encoding_preset is None:
+        encoding_preset = defaults.get("encoding_preset", "veryfast")
+    if encoding_crf is None:
+        encoding_crf = defaults.get("encoding_crf", 23)
+
+    info = _get_video_info(video_path)
+    if not info.get("has_video", True):
+        raise RuntimeError(
+            f"Source {video_path} has no decodable video stream.")
+    src_w, src_h = info["width"], info["height"]
+    src_dur = info.get("duration") or 0.0
+    has_audio = info.get("has_audio", False)
+    play_res_x, play_res_y = src_w, src_h
+
+    # Seek window
+    if end is None:
+        end = src_dur if src_dur > 0 else 0.0
+    end = max(end, start + 0.001)
+    seg_duration = end - start
+
+    # ── subtitle ASS (reuse production generator) ─────────────────────────
+    ass_path = None
+    if subtitle_words and (subtitle_position or True):
+        ass_content = generate_ass_subtitles(
+            subtitle_words,
+            play_res_x=play_res_x,
+            play_res_y=play_res_y,
+            position=subtitle_position,
+            subtitle_margin_pct=subtitle_margin_pct,
+            font_size_pct=(subtitle_font_size_pct
+                           if subtitle_font_size_pct is not None else 3.2),
+        )
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".ass", prefix="sosmed_single_sub_",
+            delete=False, mode="w", encoding="utf-8",
+        )
+        tmp.write(ass_content)
+        tmp.close()
+        ass_path = tmp.name
+
+    try:
+        cmd: list[str] = [get_ffmpeg(), "-y", "-hide_banner"]
+        # Input seeking: accurate to the ms. -ss before -i is fast (keyframe +
+        # precise decode); fine for whole-video subtitling where start==0.
+        if start > 0:
+            cmd += ["-ss", f"{start:.3f}", "-accurate_seek"]
+        cmd += ["-i", video_path, "-t", f"{seg_duration:.3f}"]
+        cmd += ["-map", "0:v:0"]
+        if has_audio:
+            cmd += ["-map", "0:a:0?"]
+
+        # video filter: subtitles (ass) + loudnorm audio
+        vfilters: list[str] = []
+        if ass_path:
+            vfilters.append(f"ass={_escape_ass_path(ass_path)}")
+        afilters: list[str] = []
+        if has_audio:
+            afilters.append("loudnorm=I=-13:LRA=7:TP=-1.0")
+
+        if vfilters:
+            cmd += ["-vf", ",".join(vfilters)]
+        if afilters:
+            cmd += ["-af", ",".join(afilters)]
+
+        # Encode: VideoToolbox (macOS hwaccel) when available + requested, else
+        # libx264 with CRF/preset. We always re-encode here because the ass
+        # subtitle filter is a decode-time filter (can't -c:v copy).
+        if (use_hwaccel and defaults.get("hwaccel", True)
+                and _is_videotoolbox_available()):
+            video_enc = ["-c:v", "h264_videotoolbox", "-quality", "speed"]
+            log("DEBUG", "Single-pass render: using VideoToolbox hardware acceleration")
+        else:
+            video_enc = ["-c:v", "libx264", "-preset", encoding_preset,
+                         "-crf", str(encoding_crf)]
+        cmd += video_enc
+
+        if has_audio:
+            audio_enc = ["-c:a", "aac", "-b:a", "192k"]
+        else:
+            audio_enc = ["-an"]
+        cmd += audio_enc
+
+        cmd += ["-shortest", "-movflags", "+faststart",
+                "-loglevel", "error", str(output_path)]
+
+        log("DEBUG", "Single-pass render cmd: " + " ".join(cmd))
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        log("DEBUG", f"Single-video render complete -> {output_path}")
+        return str(output_path)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        detail = (e.stderr[:300] if isinstance(e, subprocess.CalledProcessError)
+                  and e.stderr else str(e))
+        log("DEBUG", f"Single-pass render failed: {detail}")
+        raise RuntimeError(f"Single-pass render failed: {detail}")
+    finally:
+        if ass_path:
+            try:
+                os.unlink(ass_path)
+            except OSError:
+                pass
+

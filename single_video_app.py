@@ -110,7 +110,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "jobs": len(JOBS)})
 
         if path.startswith("/api/single/job/"):
-            job_id = path.split("/")[-1]
+            # urlparse does NOT percent-decode, so a job id from a filename
+            # with spaces arrives as "…V1%20.mp4"; decode before the lookup.
+            job_id = urllib.parse.unquote(path.split("/")[-1])
             job = get_job(job_id)
             if not job:
                 return self._send_json({"error": "job not found"}, 404)
@@ -127,6 +129,7 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/files/single/"):
             _, _, rest = path.partition("/files/single/")
             job_id, _, fname = rest.partition("/")
+            job_id = urllib.parse.unquote(job_id)
             job = get_job(job_id)
             if not job or not job.output_dir:
                 return self._send_json({"error": "not found"}, 404)
@@ -154,6 +157,39 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+
+        # ── MOCK PREVIEW (single dashboard) ──────────────────────────────
+        # Render a sample subtitled clip via the REAL ASS burning code so you
+        # can verify the subtitle look/position WITHOUT a real upload or API
+        # key. POST /api/single/mock (form or JSON). Mirrors /api/single/process.
+        if path == "/api/single/mock":
+            from sosmed.mock import build_single_mock_job
+            mock_opts: dict = {}
+            if self.headers.get("Content-Type", "").startswith("application/json"):
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    if length:
+                        mock_opts = json.loads(self.rfile.read(length)) or {}
+                except Exception:
+                    mock_opts = {}
+            else:
+                length = int(self.headers.get("Content-Length", 0))
+                if length:
+                    try:
+                        _, form = parse_multipart(
+                            self.rfile.read(length),
+                            self.headers.get("Content-Type", "")
+                            .split("boundary=")[-1].strip().strip('"'))
+                        mock_opts = dict(form)
+                    except Exception:
+                        mock_opts = {}
+            job = build_single_mock_job({
+                "subtitle_position": mock_opts.get("subtitle_position", "lower"),
+                "subtitle_font_size_pct": mock_opts.get("subtitle_font_size_pct", ""),
+                "translated": str(mock_opts.get("subtitle_mode", "original"))
+                == "translate",
+            })
+            return self._send_json({"job_id": job.id, "state": job.to_dict()})
 
         if path != "/api/single/process":
             return self._send_json({"error": "unknown endpoint"}, 404)
@@ -207,6 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             "batch": int(form.get("batch", 16)),
             "subtitle_mode": form.get("subtitle_mode", "original"),
             "subtitle_position": form.get("subtitle_position", "lower"),
+            "subtitle_font_size_pct": form.get("subtitle_font_size_pct", ""),
             "subtitle_margin_pct": float(form.get("subtitle_margin_pct", 25.0))
             if form.get("subtitle_margin_pct") else None,
             "no_cache": form.get("no_cache", "off") == "on",

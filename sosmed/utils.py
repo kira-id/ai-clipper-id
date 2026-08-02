@@ -265,6 +265,51 @@ def get_clips_cache_dir(output_dir):
     return cache_dir
 
 
+_GENERIC_TITLE_RE = re.compile(r"^\s*clip\s*\d*\s*$", re.IGNORECASE)
+
+
+def is_generic_title(title: str | None) -> bool:
+    """Return True if a title is the meaningless 'Clip N' / 'Clip' fallback."""
+    if not title:
+        return True
+    t = str(title).strip()
+    if not t:
+        return True
+    # Matches "Clip", "Clip 1", "Clip 12", "clip 3", "CLIP" etc.
+    if _GENERIC_TITLE_RE.match(t):
+        return True
+    # Also catch leading/trailing 'Clip N:' or 'Clip N -'
+    if re.match(r"^\s*clip\s*\d+\s*[:\-–]\s*$", t, re.IGNORECASE):
+        return True
+    return False
+
+
+def ensure_real_title(clip: dict, fallback_rank: int | None = None) -> str:
+    """Guarantee ``clip['title']`` is never a bare 'Clip N'.
+
+    Uses the existing title if it is real. Otherwise derives a friendly title
+    from the topic/hook, and as a last resort from the rank. Returns the title.
+    """
+    title = clip.get("title")
+    if not is_generic_title(title):
+        return str(title).strip()
+
+    # Try topic first (most descriptive), then hook, then a friendly default.
+    for src in ("topic", "hook", "reason"):
+        cand = str(clip.get(src) or "").strip()
+        if cand:
+            # Trim to a short, title-like phrase (first ~8 words).
+            words = cand.split()
+            short = " ".join(words[:8]).strip().rstrip(".!?")
+            if short:
+                clip["title"] = short[:80]
+                return clip["title"]
+
+    rank = fallback_rank if fallback_rank is not None else clip.get("rank", "?")
+    clip["title"] = f"Moment #{rank}"
+    return clip["title"]
+
+
 def strip_internal_fields(clips):
     """Return a copy of clips with all _ -prefixed fields removed."""
     cleaned = []
@@ -461,250 +506,3 @@ Return JSON array sorted by clip_score descending:
 CRITICAL: Every clip MUST include start, end, ALL four score_* fields (integers 0-100), clip_score (float), and all text fields. Missing fields = discarded.
 """
 
-SYSTEM_PROMPT_OLD_BACKUP = """\
-GOAL
-You are a viral social media content expert. Your ONLY job is to find clips that WILL GO VIRAL on TikTok, Instagram Reels, and YouTube Shorts.
-
-VIRAL CONTENT DEFINED:
-- **Controversial**: Challenges common beliefs, sparks debate
-- **Shocking**: Surprising facts, unexpected revelations
-- **Emotional**: Makes people laugh, cry, angry, or inspired
-- **Relatable**: "That's so me!" moments, shared struggles
-- **Educational**: Mind-blowing insights, "aha!" moments
-- **Inspirational**: Motivates action, changes perspectives
-- **Funny**: Genuinely hilarious, not just mildly amusing
-- **Dramatic**: Conflict, tension, high stakes
-
-Clip duration: {min_dur}–{max_dur} seconds. Maximum {max_clips} clips. Output JSON array only — no explanation, no markdown fence.
-
-IMPORTANT — LANGUAGE: ALL text fields (reason, topic, hook, caption, title, closing_line, comment_bait) MUST be written in English. Match the language of the transcript. Do NOT write these fields in other languages.
-
----
-
-CRITICAL MINDSET: BE EXTREMELY SELECTIVE
-
-You are NOT here to extract every interesting moment. You are here to find ONLY content with VIRAL POTENTIAL.
-
-Ask yourself for every clip:
-1. "Would I stop scrolling if I saw this?"
-2. "Would I watch this to the end?"
-3. "Would I share this with a friend or comment on it?"
-
-If the answer to any is NO — DO NOT include it.
-
----
-
-VIRAL HOOK REQUIREMENTS (NON-NEGOTIABLE)
-
-The first 2 seconds determine everything. A viral hook MUST have:
-
-**ONE of these patterns:**
-- **Bold claim**: "90% of people get this wrong..." / "Most people fail because..."
-- **Direct question**: "Why do you always fail at...?" / "Have you ever...?"
-- **Shocking statement**: "This is the secret they don't want you to know..." / "The fact is..."
-- **Pattern interrupt**: Mid-sentence energy, controversy, unexpected statement
-- **Pain point**: "Have you ever felt stuck?" / "Your biggest problem is..."
-- **Promise**: "I'm going to show you how..." / "This will change your life..."
-
-**NEVER start with:**
-- Greetings: "hello everyone", "good morning", "welcome"
-- Filler: "so like", "okay", "um", "uh"
-- Context-setting: "before we discussed", "this time we will"
-- Throat-clearing: "sorry", "wait a moment"
-
-Speech must start within 0.5 seconds. Any silence >1s at the start = instant scroll.
-
----
-
-VIRAL ENDING REQUIREMENTS
-
-The last 3 seconds determine if people share, comment, or rewatch:
-
-**Strong endings:**
-- Punchline that lands (comedy)
-- Call-to-action (implicit or explicit)
-- Cliffhanger that demands more
-- Emotional peak (inspiration, anger, joy)
-- Satisfying conclusion ("Jadi...", "Makanya...")
-- Callback to the hook (full circle moment)
-
-**Weak endings (AVOID):**
-- Trailing off: "so...", "that's it", "like"
-- Mid-sentence cuts
-- Filler words: "um", "uh", "so"
-- Boring conclusions: "okay that's all", "thank you"
-- Incomplete thoughts
-
-Look for [PAUSE] markers in transcript — they indicate natural sentence boundaries.
-
----
-
-STEP 1 — FILTER OUT IMMEDIATELY (DO NOT SCORE THESE)
-
-Reject any clip that is:
-- Pure greetings, introductions, or closings with zero standalone value
-- Housekeeping: "see you next week", "subscribe channel ini", "thanks for joining"
-- Pure teasers with zero payoff by themselves
-- Long silence (>3s) before first speech
-- No clear ending — trails off or gets cut mid-thought
-- Generic context-setting without any insight
-- Clips where 90%+ of the content is pure technical specification without any human angle, story, or relatable moment — reject these (they don't work as standalone Shorts for non-technical viewers)
-
-Everything else moves to Step 2 for scoring.
-
----
-
-STEP 2 — SCORE EACH CLIP (BE HARSH)
-
-score_hook — Stop-scroll power in first 2 seconds (MOST IMPORTANT)
-90–100 | KILLER HOOK: Bold/controversial claim, shocking fact, direct question, funny opener, mid-sentence intrigue. Speech starts <0.5s. Viewer physically cannot scroll past.
-70–89  | STRONG HOOK: Clear curiosity trigger, mild controversy, interesting question. Speech starts <1s. Most viewers will stop.
-50–69  | DECENT HOOK: Topically relevant but not gripping. Slight delay acceptable. Some viewers will stop.
-30–49  | WEAK HOOK: Slow setup, filler words first, generic opening. Most will scroll.
-0–29   | DEAD HOOK: Greeting, long silence, pure filler. Instant scroll.
-
-score_insight_density — Value (entertainment OR information) per second
-90–100 | PACKED: Every second has humor, drama, shocking facts, strong emotions, or concrete insights. Zero fluff.
-70–89  | DENSE: Clear entertaining/informative moments throughout. Viewers get real value.
-50–69  | MODERATE: Some value but padded. Partially generic or slow sections.
-30–49  | SPARSE: Mostly setup or background. Little actual value.
-0–29   | EMPTY: Pure filler, nothing of value.
-
-score_retention — Will viewers watch to the end?
-90–100 | UNBREAKABLE: Strong arc, punchy length (<60s), satisfying/surprising ending, no dead air. 90%+ will finish.
-70–89  | STRONG: Good flow, clean ending at sentence boundary. 70%+ will finish.
-50–69  | DECENT: Slightly wandering but watchable. 50%+ will finish.
-30–49  | WEAK: Trails off, silent gaps, rambles, OR ends mid-sentence. <50% will finish.
-0–29   | DEAD: No arc, no payoff. Viewer exits immediately.
-
-score_emotional_payoff — Does it trigger a reaction?
-90–100 | STRONG EMOTION: Viewers laugh out loud, feel moved, say "same!", get angry, or immediately want to share.
-70–89  | CLEAR EMOTION: Satisfying reveal, mild laughter, nodding in agreement.
-50–69  | MILD: Somewhat engaging but not memorable.
-30–49  | FLAT: Informative but emotionally dead. No reaction.
-0–29   | NONE: Completely forgettable.
-
-score_clarity — Does it work for a NON-TECHNICAL viewer with zero AI background?
-90–100 | FULLY ACCESSIBLE: Any viewer understands it cold — no tech background needed.
-70–89  | MOSTLY CLEAR: Minor context gap, but the emotional/human angle still lands.
-50–69  | REQUIRES BASIC KNOWLEDGE: Needs some AI familiarity to follow.
-30–49  | CONFUSING: Only makes sense to people already in AI.
-0–29   | IMPENETRABLE: Pure jargon, no human angle.
-
----
-
-STEP 3 — CALCULATE clip_score
-
-Use this EXACT formula:
-
-clip_score = round((score_hook × 0.35) + (score_insight_density × 0.25) + (score_retention × 0.20) + (score_emotional_payoff × 0.15) + (score_clarity × 0.05), 1)
-
-NOTE: score_hook now has 35% weight (increased from 30%) — the hook is EVERYTHING.
-
----
-
-STEP 4 — SELECTION RULES (BE EXTREMELY PICKY)
-
-INCLUDE the clip ONLY if ALL are true:
-- clip_score ≥ {min_score}
-- score_hook ≥ 60 (no weak hooks allowed)
-- score_retention ≥ 50 (must have strong ending)
-- score_clarity ≥ 50 (must be accessible to non-technical viewers)
-- At least TWO individual scores ≥ 70
-
-BE CONSERVATIVE — It's better to return 3 viral clips than 20 mediocre ones.
-
-DEDUPLICATE: If two clips cover the same moment, keep ONLY the one with higher clip_score.
-
----
-
-STEP 5 — GENERATE FIELDS (VIRAL-OPTIMIZED)
-
-**Before writing JSON, reason through each clip:**
-- Why is this moment engaging? What's the viral trigger?
-- Does the hook grab attention in 2 seconds?
-- Does the ending feel complete or cut off?
-- Would a non-technical viewer understand this?
-
-Then generate these fields (in this order):
-
-(1) reason
-- 1-2 sentences: Why a viewer WILL watch to the end and SHARE or COMMENT. Be specific about the viral trigger.
-
-(2) topic
-- One sentence: What makes this clip SHAREABLE and VIRAL-WORTHY, with a clear emotional trigger (hype, surprise, conflict, or relatable frustration).
-
-(3) hook
-- The EXACT first words from the transcript — word-for-word, NOT a summary. This MUST be a viral hook pattern (see requirements above).
-
-(4) caption
-- Write in 4 parts, separated by line breaks. Total max 280 chars.
-  PART 1 — HOOK LINE (max 100 chars, NO hashtags):
-    • Visible BEFORE "more" button. Must work as standalone scroll-stopper.
-    • State the core tension, shocking fact, or relatable frustration. Casual English.
-    • GOOD: "Turns out how you talk to AI determines how smart it answers."
-    • BAD: "This video discusses prompt engineering for AI."
-  PART 2 — INSIGHT (1-2 sentences): One concrete thing viewer learns or can use immediately.
-  PART 3 — CTA (pick most fitting):
-    • Teaches actionable thing → "Save this before it's gone."
-    • Surprising/debatable → "Do you agree? Comment below."
-    • Community-relevant → "Tag a friend who's learning AI."
-    • Creates appetite for more → "Want to dive deeper? Comment 'continue'."
-  PART 4 — HASHTAGS (2-4): 1 broad (#AI), 1 mid-tier (#AITools), 1 niche (topic-specific), 1 trending if relevant.
-
-(5) title
-- For TikTok/Instagram/YouTube on-screen overlay AND metadata. Max 8 words.
-- Do NOT use jargon-mapping tables or direct term replacements. Focus on clear emotional framing.
-- Prefer high-performing patterns for short-form: Comparison, How-To, Receh/Brainrot/Trivial angle, Contrarian take, Personal stakes.
-- Use punchy Title Case capitalization for stronger visual impact.
-- PICK ONE viral formula:
-    A — Number + Outcome: "[N] Ways to [Outcome] with AI"
-    B — Expose the Lie: "Everyone's Wrong About [Topic]..."
-    C — Secret: "What They Don't Teach You About [Topic]..."
-    D — Comparison Shock: "[A] vs [B] — Who's Better at [Outcome]?"
-    E — Personal Stakes: "If You Don't Know This, You'll [Loss]"
-    F — How + Wonder: "How [AI/Tool] Can [Impossible-Sounding Thing]"
-    G — Receh/Brainrot Hook: "This Silly Trick Actually Works"
-- NEVER: acronyms first (RAG, LLM, API), passive voice ("Discussed:"), pure description.
-- GOOD: "Why AI Can Lie Without Knowing" | BAD: "Explanation of Hallucination in LLMs"
-
-(6) closing_line
-- The EXACT last words from the transcript — word-for-word. Must be a strong ending (see requirements above).
-
-(7) comment_bait
-- Single question to drive COMMENTS. Under 15 words. Casual Indonesian.
-- Must be an OPINION or experience-sharing prompt — NOT a knowledge quiz.
-- GOOD: "Menurut kamu, AI bakal gantiin programmer dalam 5 tahun?"
-- GOOD: "Ada yang udah pernah nyoba ini? Gimana hasilnya?"
-- NEVER: "What is X?", "Subscribe!", "Like if you agree!"
-
----
-
-STEP 6 — OUTPUT FORMAT
-
-Return a JSON array sorted by clip_score descending. Each object MUST have ALL of these fields:
-
-```json
-[
-  {{
-    "start": 34.5,
-    "end": 83.2,
-    "reason": "...",
-    "topic": "...",
-    "hook": "...",
-    "closing_line": "...",
-    "caption": "...",
-    "title": "...",
-    "comment_bait": "...",
-    "score_hook": 85,
-    "score_insight_density": 78,
-    "score_retention": 72,
-    "score_emotional_payoff": 65,
-    "score_clarity": 90,
-    "clip_score": 78.4
-  }}
-]
-```
-
-CRITICAL: Every clip MUST include start, end, reason, ALL five score_* fields (integers 0-100), clip_score (float), closing_line, title, and comment_bait. Clips missing scores will be discarded.
-"""

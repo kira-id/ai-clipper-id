@@ -36,6 +36,21 @@ from .utils import log
 from .config import get_cta_settings, get_defaults
 
 
+def _opt_float(opts: dict, key: str) -> float | None:
+    """Read an optional float option (e.g. subtitle font size pct).
+
+    Returns None when the key is missing or empty so callers fall back to
+    their configured default.
+    """
+    v = opts.get(key, None)
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── Ordered pipeline steps (drives the dashboard stepper) ──────────────────
 STEPS = [
     "upload",
@@ -154,7 +169,14 @@ class Job:
 
 
 JOBS: dict[str, Job] = {}
-_JOBS_LOCK = threading.Lock()
+# RLock so re-entrant helper calls (e.g. run_single holding _JOBS_LOCK while
+# calling _find_running_job_for, which also locks) don't deadlock.
+_JOBS_LOCK = threading.RLock()
+
+
+def _video_lock_key(video_path: str) -> str:
+    """Stable key for a video across submissions (resolved absolute path)."""
+    return str(Path(video_path).resolve())
 
 
 def get_job(job_id: str) -> Job | None:
@@ -162,11 +184,46 @@ def get_job(job_id: str) -> Job | None:
         return JOBS.get(job_id)
 
 
+def _find_running_job_for(video_path: str) -> Job | None:
+    """Return an in-flight Job for the same video, if any (else None).
+
+    Two concurrent runs for the SAME video re-encode into the same
+    clips/<VideoName>/ path; the second ffmpeg -y truncates the first's
+    in-progress file, yielding a corrupt MP4 that fails post-processing.
+    """
+    key = _video_lock_key(video_path)
+    with _JOBS_LOCK:
+        for job in JOBS.values():
+            if (not job.finished
+                    and _video_lock_key(job.video_path) == key):
+                return job
+    return None
+
+
 def run_single(video_path: str, options: dict) -> Job:
-    """Create a Job, start it in a background thread, return it immediately."""
+    """Create a Job, start it in a background thread, return it immediately.
+
+    If another run for the SAME video is already in flight, returns that
+    running Job instead of starting a competing one (which would clobber its
+    single output file with a corrupt truncated MP4).
+    """
+    existing = _find_running_job_for(video_path)
+    if existing is not None:
+        log("WARN",
+            f"A job for {Path(video_path).name} is already running "
+            f"(job_id={existing.id}); returning it instead of starting a "
+            f"duplicate run that would overwrite its output.")
+        return existing
+
     job_id = f"sv-{int(time.time()*1000)}-{Path(video_path).stem}"
     job = Job(job_id, video_path, options)
     with _JOBS_LOCK:
+        dup = _find_running_job_for(video_path)
+        if dup is not None:
+            log("WARN",
+                f"Duplicate concurrent submission for {Path(video_path).name} "
+                f"raced through; returning existing job {dup.id}.")
+            return dup
         JOBS[job_id] = job
 
     t = threading.Thread(target=_run, args=(job,), daemon=True)
@@ -186,9 +243,9 @@ def _run(job: Job) -> None:
 
     from .transcription import transcribe
     from .prefilter import prefilter_segments
-    from .extraction import extract_clips, _get_video_duration
-    from .postprocess import postprocess_clips
-    from .subtitles import get_clip_words, generate_ass_subtitles
+    from .extraction import _get_video_duration
+    from .subtitles import get_clip_words
+    # render_single_video is imported locally at the render step
 
     try:
         from .config import load_config
@@ -297,45 +354,40 @@ def _run(job: Job) -> None:
                           f"{len(words)} words · "
                           f"{'translated' if translated else 'original language'}")
 
-        # 3. RENDER — extract the full video, then burn subtitles.
-        job.set_step("render", "Extracting + burning subtitles…")
-        from .cli import _ensure_filenames
-        _ensure_filenames([full_clip])
-
-        raw_outputs = extract_clips(
-            video, [full_clip],
-            output_dir=output_dir,
-            max_workers=1,
-            encoding_preset=opts.get("encoding_preset"),
-            encoding_crf=opts.get("encoding_crf"),
-        )
-        if not raw_outputs:
-            raise RuntimeError("Failed to extract full video.")
-
-        _cta_cfg = {**get_cta_settings(),
-                    "enabled": bool(opts.get("cta", False))}
-        outputs = postprocess_clips(
-            raw_outputs, [full_clip], segments,
-            output_dir=output_dir,
-            subtitles=True,
+        # 3. RENDER — burn subtitles + loudnorm in ONE pass straight from source.
+        # Previously this ran extract_clips (full re-encode of the whole video)
+        # THEN postprocess_clips (a SECOND full re-encode to burn subtitles).
+        # Two full-resolution 4K transcodes of the same content — the single
+        # biggest time sink and the reason a concurrent run could clobber a
+        # 7-minute in-progress write into a corrupt MP4. render_single_video
+        # decodes the source once and writes the final subtitled/loudnorm'd
+        # clip directly.
+        job.set_step("render", "Burning subtitles (single pass)…")
+        from .postprocess import render_single_video
+        final_path = output_dir / f"{Path(video).stem}_final.mp4"
+        render_single_video(
+            video,
+            str(final_path),
+            words,
             subtitle_position=opts.get("subtitle_position", "lower"),
+            subtitle_font_size_pct=_opt_float(opts, "subtitle_font_size_pct"),
             subtitle_margin_pct=opts.get("subtitle_margin_pct"),
-            enable_title=False,
-            orientation="auto",
-            enable_crop=False,
-            enable_active_speaker=False,
-            enable_silence_removal=opts.get("remove_silence", False),
-            max_silence=opts.get("max_silence", 1.5),
-            cta_config=_cta_cfg,
+            start=0.0,
+            end=video_dur,
             encoding_preset=opts.get("encoding_preset"),
             encoding_crf=opts.get("encoding_crf"),
         )
-        if not outputs:
-            raise RuntimeError(
-                "Rendering produced no output — subtitles were not burned in. "
-                "Check the log above for the ffmpeg error.")
-
-        final_path = outputs[0] if outputs else raw_outputs[0]
+        # Optional CTA outro appended after the single-pass render.
+        if bool(opts.get("cta", False)):
+            _cta_cfg = {**get_cta_settings(), "enabled": True}
+            from .cta import append_instagram_cta
+            append_instagram_cta(
+                str(final_path), str(final_path),
+                name=str(_cta_cfg.get("name", "Samuel Academy")),
+                username=str(_cta_cfg.get("username", "@samuelkoesnadi")),
+                duration=float(_cta_cfg.get("duration", 3.0)),
+                fade_duration=float(_cta_cfg.get("fade_duration", 0.5)),
+            )
         job.output_path = str(final_path)
         job.outputs.append({
             "filename": Path(final_path).name,

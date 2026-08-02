@@ -424,13 +424,15 @@ def build_dynamic_crop_filter(
 
     keys_x: list[tuple[float, float]] = []
     keys_y: list[tuple[float, float]] = []
+    keys_track: list[int] = []
     for region in crop_regions:
         t = float(region["time"])
         keys_x.append((t, min(max(0.0, float(region["x"])), float(max_x))))
         keys_y.append((t, min(max(0.0, float(region["y"])), float(max_y))))
+        keys_track.append(int(region.get("track_id", -1)))
 
-    x_expr = _build_interpolation_expr(keys_x)
-    y_expr = _build_interpolation_expr(keys_y)
+    x_expr = _build_interpolation_expr(keys_x, keys_track)
+    y_expr = _build_interpolation_expr(keys_y, keys_track)
 
     # Commas and single quotes are filter-graph separators. Escape every comma
     # inside the expressions so the whole `if(...)` tree survives ffmpeg's
@@ -446,18 +448,27 @@ def build_dynamic_crop_filter(
 
 def _build_interpolation_expr(
     keyframes: list[tuple[float, float]],
+    tracks: list[int] | None = None,
 ) -> str:
-    """Build an FFmpeg expression that linearly interpolates between keyframes.
+    """Build an FFmpeg expression that pans to each keyframe.
 
     Uses the timeline variable ``t`` (seconds) rather than the frame counter
     ``n`` so the result is correct at any frame rate. The previous version
     hardcoded 30fps, so tracking drifted badly on 25/50/60fps sources.
 
+    When ``tracks`` is provided, the expression HOLDS (step) the value across a
+    speaker change (two adjacent keyframes with different ``track_id``) instead
+    of linearly interpolating. That produces a hard CUT / jump between people —
+    a smooth linear pan between two speakers would sweep across the scene and
+    make viewers dizzy. Within the same speaker (same track_id) it still
+    interpolates smoothly so a single talking head stays stable.
+
     Args:
         keyframes: List of (time_seconds, value) tuples
+        tracks: Optional parallel list of track ids (one per keyframe)
 
     Returns:
-        FFmpeg expression string using nested if() for piecewise interpolation.
+        FFmpeg expression string using nested if() for piecewise motion.
     """
     if not keyframes:
         return "0"
@@ -465,20 +476,44 @@ def _build_interpolation_expr(
         return f"{keyframes[0][1]:.2f}"
 
     keyframes = sorted(keyframes, key=lambda kv: kv[0])
+    if tracks is None:
+        tracks = [-1] * len(keyframes)
+    # Legacy callers (largest-person crop) pass no track ids (all -1). In that
+    # case behave exactly as before: always interpolate smoothly.
+    _has_track_info = any(t >= 0 for t in tracks)
 
     exprs: list[str] = []
     for i in range(len(keyframes) - 1):
         t1, v1 = keyframes[i]
         t2, v2 = keyframes[i + 1]
+        same_speaker = (
+            _has_track_info
+            and (tracks[i] == tracks[i + 1])
+            and tracks[i] >= 0
+        )
 
         if t2 <= t1:
             # Duplicate / non-monotonic timestamp — hold the earlier value.
             exprs.append(f"if(lte(t,{t1:.3f}),{v1:.2f},")
             continue
 
-        slope = (v2 - v1) / (t2 - t1)
-        interp = f"{v1:.2f}+({slope:.4f})*(t-{t1:.3f})"
-        exprs.append(f"if(lte(t,{t2:.3f}),{interp},")
+        if not _has_track_info:
+            # No speaker/track info (legacy largest-person crop): always
+            # interpolate smoothly — there is only one tracked subject, so a
+            # smooth pan is correct and desirable.
+            slope = (v2 - v1) / (t2 - t1)
+            interp = f"{v1:.2f}+({slope:.4f})*(t-{t1:.3f})"
+            exprs.append(f"if(lte(t,{t2:.3f}),{interp},")
+        elif same_speaker:
+            # Smooth pan within the same speaker.
+            slope = (v2 - v1) / (t2 - t1)
+            interp = f"{v1:.2f}+({slope:.4f})*(t-{t1:.3f})"
+            exprs.append(f"if(lte(t,{t2:.3f}),{interp},")
+        else:
+            # Speaker change: HARD CUT. Hold the OLD speaker's position (v1)
+            # for the whole interval up to t2, then the next branch snaps to the
+            # new speaker (v2) at t >= t2. No slide across the scene.
+            exprs.append(f"if(lte(t,{t2:.3f}),{v1:.2f},")
 
     # Past the final keyframe: hold the last value.
     exprs.append(f"{keyframes[-1][1]:.2f}")

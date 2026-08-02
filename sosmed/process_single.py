@@ -155,6 +155,7 @@ def process_single_video(
     subtitles: bool = True,
     subtitle_position: str = "lower",
     subtitle_margin_pct: float | None = None,
+    subtitle_font_size_pct: float | None = None,
     title: str | None = None,
     caption: str | None = None,
     cta: bool | None = None,
@@ -263,7 +264,7 @@ def process_single_video(
             api_key=api_key,
         )
         # Cache the generated metadata fields
-        _meta_fields = ["title", "topic", "caption", "reason", "hook", "closing_line", "comment_bait"]
+        _meta_fields = ["title", "topic", "caption", "reason", "hook", "closing_line", "comment_bait", "social_description"]
         _cached_meta = {k: clips[0][k] for k in _meta_fields if k in clips[0]}
         _meta_cache_path.write_text(json.dumps(_cached_meta, indent=2, ensure_ascii=False), encoding="utf-8")
         log("OK", f"LLM metadata cached → {_meta_cache_path}")
@@ -372,6 +373,7 @@ def process_single_video(
             subtitles=subtitles,
             subtitle_position=subtitle_position,
             subtitle_margin_pct=subtitle_margin_pct,
+            subtitle_font_size_pct=subtitle_font_size_pct,
             enable_title=False,
             cta_config=cta_cfg,
             encoding_preset=encoding_preset,
@@ -555,6 +557,11 @@ def main() -> None:
     ap.add_argument("--subtitle-margin", type=float,
                     default=defaults.get("subtitle_margin_pct"),
                     help="Subtitle margin from bottom for 'lower' position in %% (default: from config or 25)")
+    ap.add_argument("--subtitle-font-size", type=float,
+                    default=defaults.get("subtitle_font_size_pct"),
+                    help="Subtitle font size as %% of vertical resolution "
+                         "(default: from config or 3.2; larger = bigger text)")
+
     ap.add_argument("--title", default=None,
                     help="Manually set the title (overrides auto-generated title; single-file mode only)")
     ap.add_argument("--caption", default=None,
@@ -596,6 +603,7 @@ def main() -> None:
         subtitles=args.subtitles,
         subtitle_position=args.subtitle_position,
         subtitle_margin_pct=args.subtitle_margin,
+        subtitle_font_size_pct=args.subtitle_font_size,
         cta=args.cta,
         encoding_preset=args.encoding_preset,
         encoding_crf=args.encoding_crf,

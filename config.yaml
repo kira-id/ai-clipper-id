@@ -35,6 +35,10 @@ defaults:
   # LLM chunking settings
   chunk_duration: 360.0  # seconds
   chunk_overlap: 60.0    # seconds
+  llm_parallel: false    # run LLM chunk + per-clip subtitle calls concurrently (faster; needs a model without tight rate limits)
+
+  # Subtitle font size as % of vertical resolution (smaller = a bit smaller than the old 3.6 default)
+  subtitle_font_size_pct: 3.2
 
   # Output directory (relative to project root)
   output_dir: clips

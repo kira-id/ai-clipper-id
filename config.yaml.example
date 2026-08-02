@@ -17,7 +17,7 @@ defaults:
   max_clip_duration: 180
 
   # Maximum number of clips to generate
-  max_clips: 10
+  max_clips: 28
 
   # Minimum engagement score to keep a clip
   min_score: 55
@@ -45,6 +45,7 @@ defaults:
   # Subtitles
   subtitles_enabled: true
   subtitle_position: lower  # Options: center, upper, lower
+  subtitle_font_size_pct: 3.2  # Subtitle font size as % of vertical resolution
   subtitle_margin_pct: 25.0  # Margin from bottom for "lower" position (in %). Use 0.0 for center, 5.0 for upper.
 
   # Person detection crop is automatic when orientation conversion is needed.

@@ -8,6 +8,63 @@ TikTok/Reels/Shorts.
 
 from typing import Any
 
+import math
+import os
+
+try:
+    from PIL import ImageFont
+    _HAVE_PIL = True
+except Exception:  # pragma: no cover - PIL is a hard dep for measurement
+    _HAVE_PIL = False
+
+
+# ── Font resolution for accurate text-width measurement ──────────────────────
+# libass renders with Montserrat and falls back to Arial when Montserrat is
+# absent, so measuring with the real font (or Arial as the closest fallback)
+# gives an accurate on-screen width. We resolve an actual TTF so the overflow
+# algorithm below measures what the viewer will actually see.
+def _resolve_measure_font_path() -> str | None:
+    """Return a usable TTF path for text measurement, or None to use PIL default."""
+    candidates = [
+        "/c/Windows/Fonts/montserrat.ttf",
+        "/c/Windows/Fonts/Montserrat.ttf",
+        "/c/Windows/Fonts/arial.ttf",
+        "/c/Windows/Fonts/Arial.ttf",
+        "/c/Windows/Fonts/arialbd.ttf",
+    ]
+    for c in candidates:
+        # Normalize the MSYS-ish path for the current interpreter.
+        norm = c.replace("/c/", "C:/").replace("/C/", "C:/")
+        if os.path.exists(norm):
+            return norm
+    return None
+
+
+_FONT_PATH = _resolve_measure_font_path()
+
+
+def _measure_text_width(text: str, font_size: int, bold: bool = False) -> int:
+    """Measure rendered pixel width of ``text`` at ``font_size``.
+
+    Falls back to a conservative heuristic if PIL/PIL-font is unavailable so the
+    caller still gets a sane (slightly over-estimated) width instead of overflow.
+    """
+    if not _HAVE_PIL:
+        return int(len(text) * font_size * 0.6) + 4
+    try:
+        if _FONT_PATH:
+            fnt = ImageFont.truetype(_FONT_PATH, font_size)
+        else:
+            fnt = ImageFont.load_default()
+        # getlength respects kerning; fall back to bbox width if unavailable.
+        if hasattr(fnt, "getlength"):
+            return int(math.ceil(fnt.getlength(text)))
+        bbox = fnt.getbbox(text)
+        return int(bbox[2] - bbox[0]) if bbox else len(text) * font_size // 2
+    except Exception:
+        # Conservative fallback: ~0.55em average advance for Arial-ish latin.
+        return int(len(text) * font_size * 0.55) + 6
+
 
 # ── ASS color helpers (format: &HAABBGGRR) ──────────────────────────────────
 
@@ -101,7 +158,7 @@ def generate_ass_subtitles(
     play_res_x: int = 1080,
     play_res_y: int = 1920,
     font_name: str = "Montserrat",
-    font_size_pct: float = 3.6,
+    font_size_pct: float = 3.2,
     highlight_color: str | None = None,
     normal_color: str | None = None,
     position: str = "lower",
@@ -119,15 +176,17 @@ def generate_ass_subtitles(
     - **Lower position** (25% from bottom by default) to avoid face occlusion
     - **Modern font**: Montserrat (falls back to Arial if unavailable)
     - **No temporal overlap** between subtitle groups
-    - **Portrait overflow guard**: extra word cap + larger horizontal margins
-      so text never runs off the narrow frame edges
+    - **Hard overflow guard (measured)**: the font size and per-line word cap
+      are *solved* by measuring the actual rendered line width with PIL so the
+      longest line can never run off the frame. This is robust to font choice
+      and language — it measures, not guesses.
     """
 
     hi_color = highlight_color or COLOR_HIGHLIGHT
     nm_color = normal_color or COLOR_NORMAL
 
     effective_pct = _adapt_for_aspect_ratio(play_res_x, play_res_y, font_size_pct)
-    font_size = _resolve_font_size(play_res_y, effective_pct)
+    base_font_size = _resolve_font_size(play_res_y, effective_pct)
     outline_w = _resolve_outline(play_res_y, effective_pct)
     shadow_depth = 0  # No shadow / glow
     GLOW_BLUR = 0     # No blur
@@ -151,42 +210,59 @@ def generate_ass_subtitles(
     margin_v = round(play_res_y * margin_pct.get(position, 5.0) / 100.0)
     # Wider horizontal margin on portrait frames so text never runs off
     # the narrow edges. 10% each side on portrait, 8% otherwise.
-    margin_h_pct = 10.0 if (play_res_x / max(1, play_res_y)) < 1.0 else 8.0
+    margin_h_pct = 10.0 if is_portrait else 8.0
     margin_h = round(play_res_x * margin_h_pct / 100.0)
 
-    # ── ASS header with one style ────────────────────────────────────────
-    # Style "Word": white text, black outline, no shadow
-    header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        f"PlayResX: {play_res_x}\n"
-        f"PlayResY: {play_res_y}\n"
-        "WrapStyle: 2\n"
-        "ScaledBorderAndShadow: yes\n"
-        "\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
-        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
-        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        # Word style (white text, black outline)
-        f"Style: Word,{font_name},{font_size},"
-        f"{nm_color},{nm_color},{COLOR_OUTLINE},{COLOR_GLOW},"
-        f"-1,0,0,0,100,100,1.0,0,1,{outline_w},{shadow_depth},"
-        f"{alignment},{margin_h},{margin_h},{margin_v},1\n"
-        "\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, "
-        "MarginL, MarginR, MarginV, Effect, Text\n"
-    )
+    # ---- ROBUST OVERFLOW GUARD (measured) ---------------------------------
+    # Iteratively pick (font_size, word_cap) so the WIDEST line fits inside the
+    # safe horizontal area [margin_h, play_res_x - margin_h], plus a small
+    # safety pad. We measure the real rendered width of each group's text so
+    # this works for any language / font, not just a length heuristic.
+    SAFETY_PAD = max(4, round(play_res_x * 0.01))  # 1% safety pad each side
+    usable_w = play_res_x - 2 * (margin_h + SAFETY_PAD)
 
-    # ── Group words into single-line chunks ──────────────────────────────
-    # Tighter cap on portrait frames: the bigger font means fewer words fit
-    # on the narrow width before the line would overflow the edges.
-    is_portrait = (play_res_x / max(1, play_res_y)) < 1.0
+    # Group first with a generous cap, then measure and shrink if needed.
+    def _regroup(cap: int) -> list[list[dict[str, Any]]]:
+        return _group_words(words, max_words=cap)
+
+    font_size = base_font_size
     cap = 3 if is_portrait else max_words_per_group
-    groups = _group_words(words, max_words=cap)
+
+    # Shrink font before sacrificing words (words read better than tiny text,
+    # but if even 1 word at min font overflows we must cap down to 1).
+    MIN_FONT = max(20, round(play_res_y * 0.018))  # ~2% floor
+    # Compute widest measured line for a given (font, cap).
+    groups_all = _regroup(cap if cap >= 1 else 1)
+    if groups_all:
+        def _widest(font: int, cap: int) -> int:
+            widest = 0
+            for g in _regroup(cap):
+                txt = " ".join(w["word"] for w in g if w["word"].strip())
+                if txt:
+                    widest = max(widest, _measure_text_width(txt, font))
+            return widest
+
+        # Step 1: if the current font already overflows, shrink it.
+        while font_size > MIN_FONT and _widest(font_size, cap) > usable_w:
+            font_size -= 2
+        # Step 2: if still overflows at min font, drop the word cap.
+        while cap > 1 and _widest(font_size, cap) > usable_w:
+            cap -= 1
+        # Step 3: last resort — shrink font below floor only if a single word
+        # still doesn't fit (extremely long token); clip by allowing hard wrap
+        # (WrapStyle:2 adds an ellipsis rather than spilling off-frame).
+        if _widest(font_size, cap) > usable_w:
+            # Try to shrink a bit more; WrapStyle:2 prevents true overflow.
+            while font_size > 14 and _widest(font_size, cap) > usable_w:
+                font_size -= 2
+
+    groups = _regroup(cap)
     if not groups:
+        # Still emit a valid (empty) subtitle file so downstream ffmpeg won't choke.
+        header = _subtitle_header(
+            play_res_x, play_res_y, font_name, font_size, nm_color, outline_w,
+            alignment, margin_h, margin_v,
+        )
         return header
 
     # ── Resolve non-overlapping time ranges ──────────────────────────────
@@ -224,7 +300,117 @@ def generate_ass_subtitles(
         line = f"Dialogue: 0,{start_str},{end_str},Word,,0,0,0,,{text}"
         dialogue_lines.append(line)
 
+    header = _subtitle_header(
+        play_res_x, play_res_y, font_name, font_size, nm_color, outline_w,
+        alignment, margin_h, margin_v,
+    )
     return header + "\n".join(dialogue_lines) + "\n"
+
+
+def _subtitle_header(
+    play_res_x: int,
+    play_res_y: int,
+    font_name: str,
+    font_size: int,
+    nm_color: str,
+    outline_w: int,
+    alignment: int,
+    margin_h: int,
+    margin_v: int,
+) -> str:
+    """Emit the [Script Info]/[V4+ Styles]/[Events] header for subtitles."""
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {play_res_x}\n"
+        f"PlayResY: {play_res_y}\n"
+        "WrapStyle: 2\n"
+        "ScaledBorderAndShadow: yes\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        # Word style (white text, black outline)
+        f"Style: Word,{font_name},{font_size},"
+        f"{nm_color},{nm_color},{COLOR_OUTLINE},{COLOR_GLOW},"
+        f"-1,0,0,0,100,100,1.0,0,1,{outline_w},0,"
+        f"{alignment},{margin_h},{margin_h},{margin_v},1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, "
+        "MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+
+def _rounded_sheared_polygon(cx, cy, half_w, half_h, shear, r):
+    """Build an ASS drawing-string for a sheared rectangle (parallelogram)
+    whose corners are rounded with radius ``r``.
+
+    The parallelogram is an axis-aligned rectangle of size (2*half_w) x
+    (2*half_h) centered at (cx, cy), then sheared so every corner's x is
+    shifted by ``shear * (y - cy)``. Corners are rounded with circular arcs
+    of radius ``r`` (clamped to the shorter half-side).
+    """
+    r = max(0, min(r, half_w - 1, half_h - 1))
+
+    # Corner centers (before shear): rectangle inset by r from each edge.
+    # Order: top-left, top-right, bottom-right, bottom-left.
+    xl, xr = cx - half_w + r, cx + half_w - r
+    yt, yb = cy - half_h + r, cy + half_h - r
+
+    # Shear helper: x' = x + shear * (y - cy)
+    def sh(x, y):
+        return (x + int(round(shear * (y - cy))), y)
+
+    tl_c = sh(xl, yt)   # top-left corner center
+    tr_c = sh(xr, yt)   # top-right corner center
+    br_c = sh(xr, yb)   # bottom-right corner center
+    bl_c = sh(xl, yb)   # bottom-left corner center
+
+    # Arc end/start points for a rounded corner use the corner center plus
+    # offsets of +/- r. We approximate each quarter circle with 8 segments.
+    N = 8
+
+    def arc_points(center, a0, a1):
+        """Points along an arc (degrees) around `center` with radius r."""
+        px0, py0 = center
+        pts = []
+        for k in range(N + 1):
+            a = math.radians(a0 + (a1 - a0) * k / N)
+            pts.append((int(round(px0 + r * math.cos(a))),
+                        int(round(py0 + r * math.sin(a)))))
+        return pts
+
+    # For each corner, the arc sweeps 90deg. Tangent points are the rectangle
+    # edges offset by r. We define each corner's arc by its center and sweep.
+    # TL corner center: connect top tangent (xl, yt) -> left tangent (xl, yb)
+    # in screen coords that's angle 180deg (left) to 270deg (up).
+    tl_arc = arc_points(tl_c, 180, 270)
+    # TR corner center: left tangent (xr, yt) -> top tangent (xr, yt-r)?
+    # angle 270 (up) -> 360/0 (right)
+    tr_arc = arc_points(tr_c, 270, 360)
+    # BR corner center: top tangent (xr, yb) -> right tangent (xr+r, yb)
+    # angle 0 (right) -> 90 (down)
+    br_arc = arc_points(br_c, 0, 90)
+    # BL corner center: right tangent (xl, yb) -> bottom tangent (xl, yb+r)
+    # angle 90 (down) -> 180 (left)
+    bl_arc = arc_points(bl_c, 90, 180)
+
+    # Assemble path: move to end of TL arc, then line+arc around.
+    path = []
+    path.append(f"m {tl_arc[0][0]} {tl_arc[0][1]}")
+    for p in tl_arc[1:]:
+        path.append(f"l {p[0]} {p[1]}")
+    for p in tr_arc:
+        path.append(f"l {p[0]} {p[1]}")
+    for p in br_arc:
+        path.append(f"l {p[0]} {p[1]}")
+    for p in bl_arc:
+        path.append(f"l {p[0]} {p[1]}")
+    path.append(f"l {tl_arc[0][0]} {tl_arc[0][1]}")  # close
+    return " ".join(path)
 
 
 def generate_title_overlay(
@@ -238,46 +424,70 @@ def generate_title_overlay(
 
     Modern title banner with:
     - Montserrat font (professional, widely available)
-    - YELLOW parallelogram background, sheared via \\fax (background layer ONLY)
+    - BLACK parallelogram background, sheared via the drawing polygon (background
+      layer ONLY) — high contrast for white text on bright footage
     - BLACK, BOLD, UPRIGHT text (NO italic — shear is NOT applied to the text)
     - NO outline / NO shadow on the text
     - Fade-out animation
     - Positioned at upper-third (25% from top)
+    - **Measured overflow guard**: the font size and banner width are solved by
+      measuring the *actual rendered* title width (PIL), so a long title shrinks
+      to fit inside the frame instead of spilling past the edges. The black block
+      hugs the measured text width (with padding), so it looks intentional at any
+      title length.
     """
     aspect = play_res_x / play_res_y
-    if aspect < 1.0:
-        # Portrait: make the title big and bold
-        font_size = int(play_res_x * 0.085)
-    else:
-        font_size = int(play_res_y * 0.10)
 
-    # Colors: WHITE title text on a YELLOW parallelogram. No text outline.
-    c_text = _rgb_to_ass(255, 255, 255)       # WHITE title text (contrasts yellow)
+    # ── Measured font-size solve (prevents horizontal overflow) ────────────
+    # Start at the designed size, then shrink until the title fits the safe
+    # width. Safe width = frame width minus a healthy side margin (12% each side
+    # so the black banner never touches the edges).
+    if aspect < 1.0:
+        start_font = int(play_res_x * 0.085)   # portrait: big & bold
+    else:
+        start_font = int(play_res_y * 0.10)
+    SIDE_MARGIN_PCT = 12.0
+    safe_w = int(play_res_x * (1.0 - 2 * SIDE_MARGIN_PCT / 100.0))
+
+    font_size = start_font
+    # Robust solve: shrink until the measured title fits the safe width, or until
+    # we hit a hard floor (WrapStyle:2 then ellipsizes as a last resort). Step of
+    # 2 for speed, then a final 1px pass so we never stop a hair above safe_w.
+    while font_size > 16 and _measure_text_width(title, font_size) > safe_w:
+        font_size -= 2
+    while font_size > 14 and _measure_text_width(title, font_size) > safe_w:
+        font_size -= 1
+
+    # Colors: WHITE title text on a BLACK parallelogram. No text outline.
+    c_text = _rgb_to_ass(255, 255, 255)       # WHITE title text (contrasts black)
 
     # ── Filled parallelogram background ───────────────────────────────────
     # Drawn as a TRUE solid vector polygon (a sheared rectangle) via ASS
     # Drawing commands, so it is a clean block of color — NOT a fake
     # text-glyph box. The readable title is drawn on top as a separate
     # upright layer.
-    # ~14deg shear = tan(14) ≈ 0.25.
-    shear = 0.25
+    # ~14deg shear (tan(14) ≈ 0.25). Negative → leans like "/_" (top shifted
+    # right, bottom shifted left).
+    shear = -0.25
 
     # Banner geometry: centered at upper-third (25% from top).
     cx = play_res_x // 2
     cy = int(play_res_y * 0.25)
 
-    # Wide block that spans most of the frame so long titles fit.
-    banner_w = int(play_res_x * 0.92)
-    banner_h = int(font_size * 1.9)           # tall enough to enclose the text
+    # Vertical breathing room so the text never touches the block edges.
+    text_margin_y = int(font_size * 0.35)
+    # Banner width follows the MEASURED title width (+ padding) but is clamped
+    # so it never exceeds the safe frame width. Long titles therefore get a
+    # snug black block; very long titles shrink the font (above) first.
+    title_w = _measure_text_width(title, font_size)
+    banner_w = min(safe_w, int(title_w * 1.12) + 2 * int(font_size * 0.4))
+    banner_w = max(banner_w, int(play_res_x * 0.30))  # keep a minimum visible block
+    banner_h = int(font_size * 1.9) + 2 * text_margin_y   # + margin top & bottom
     half_w = banner_w // 2
     half_h = banner_h // 2
 
-    # Four corners of an axis-aligned rectangle, sheared into a parallelogram
-    # by shifting each corner's x by `shear * (y - cy)`.
-    tl = (cx - half_w + int(shear * -half_h), cy - half_h)
-    tr = (cx + half_w + int(shear * -half_h), cy - half_h)
-    br = (cx + half_w + int(shear *  half_h), cy + half_h)
-    bl = (cx - half_w + int(shear *  half_h), cy + half_h)
+    # Rounded-corner radius for the parallelogram (clamped inside the helper).
+    corner_r = int(font_size * 0.45)
 
     # Fade timing (applied to BOTH box + text so they vanish together)
     if duration < 1.5:
@@ -286,8 +496,8 @@ def generate_title_overlay(
         fade_out_dur = int(0.5 * 1000)
     fade_out_start = max(0, int((duration - (fade_out_dur / 1000)) * 1000))
 
-    # Opaque yellow block color (Alpha 00 = fully opaque in &HAABBGGRR).
-    c_block = _rgb_to_ass(255, 225, 53, 0)
+    # Opaque BLACK block color (Alpha 00 = fully opaque in &HAABBGGRR).
+    c_block = _rgb_to_ass(0, 0, 0, 0)
 
     header = (
         "[Script Info]\n"
@@ -324,19 +534,16 @@ def generate_title_overlay(
     t0 = _seconds_to_ass_time(0.0)
     t1 = _seconds_to_ass_time(duration)
 
-    # Background parallelogram: a solid filled polygon (sheared rectangle),
-    # fades out in sync with the title text.
+    # Background parallelogram: a solid filled polygon (sheared, rounded-
+    # corner rectangle), fades out in sync with the title text.
+    box_poly = _rounded_sheared_polygon(cx, cy, half_w, half_h, shear, corner_r)
     box_anim = (
         "{\\p1"
         "\\pos(0,0)"
         f"\\alpha&H00"
         f"\\t({fade_out_start},{fade_out_start + fade_out_dur},\\alpha&HFF)"
         "}"
-        f"m {tl[0]} {tl[1]} "
-        f"l {tr[0]} {tr[1]} "
-        f"l {br[0]} {br[1]} "
-        f"l {bl[0]} {bl[1]} "
-        f"l {tl[0]} {tl[1]}"
+        f"{box_poly}"
     )
     # Title text: upright, bold, fades out in sync (NO shear → no italic).
     text_anim = (

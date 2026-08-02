@@ -11,28 +11,29 @@ by ``str.format()``.
 PROMPTS = {
     "Generate Single Clip Metadata": """Rewrite metadata for a single full-video clip using the transcript. Maximize viral potential—choose high-engagement wording over bland accuracy.
 
-Rewrite ONLY: reason, title, topic, caption, comment_bait, hook, closing_line. Keep all timing/score/rank/filename fields unchanged.
+Rewrite ONLY: reason, title, topic, caption, comment_bait, hook, closing_line, social_description. Keep all timing/score/rank/filename fields unchanged.
 
 Field specs:
 - reason: 1-2 sentences on why this clip is compelling
-- title: Max 8 words, Title Case, emotional. Use viral formats (Comparison, How-To, Receh/Brainrot, Secret, Personal Stakes, Contrarian)
+- title: Max 8 words. Friendly, warm and easy to understand even for a child. A gentle, curious hook — NEVER name it "Clip 1", "Clip 2", or any "Clip N". Use simple inviting words (e.g. "Why this little trick changes everything", "The silly mistake we all make"). No clickbait rage.
 - topic: One sentence, core idea with emotional/curiosity angle
-- caption: hook → insight → CTA → hashtags. Max 280 chars
+- caption: hook → insight → CTA → hashtags. Max 280 chars. Friendly and easy to read.
 - comment_bait: Casual Indonesian. Opinion/experience question, NOT a quiz. Under 15 words
 - hook: Strongest opening line from transcript (tighten if needed, stay faithful)
 - closing_line: EXACT last words from transcript, word-for-word
+- social_description: Friendly, approachable 2-3 sentence social-media description a child could understand. Starts with a hook, says why the clip is fun or useful, ends with a gentle invite to watch and share. No hashtags here.
 
 Language: All fields in English except comment_bait (Indonesian). Translate if needed. No invented facts.
 
 Return ONLY valid JSON array (one item), no other text.""",
 
-    "Translate to English": """For each clip, translate reason, topic, caption, hook, closing_line to English if not already. Preserve meaning, tone, and marketing appeal.
+    "Translate to English": """For each clip, translate reason, topic, caption, hook, closing_line, social_description to English if not already. Preserve meaning, tone, and marketing appeal.
 
 Do NOT translate "title" or "comment_bait"—keep as-is. Keep all other fields unchanged.
 
 Return ONLY valid JSON array, no other text.""",
 
-    "Translate to Target Language": """For each clip, translate reason, topic, caption, hook, closing_line to {TARGET_LANGUAGE} if not already in that language. Preserve meaning, tone, and marketing appeal.
+    "Translate to Target Language": """For each clip, translate reason, topic, caption, hook, closing_line, social_description to {TARGET_LANGUAGE} if not already in that language. Preserve meaning, tone, and marketing appeal.
 
 Do NOT translate "title" or "comment_bait"—keep as-is. Keep all other fields unchanged.
 
@@ -55,6 +56,7 @@ Return ONLY valid JSON array, no other text.""",
    - Topics: make emotional/curiosity-driven, not generic labels
    - comment_bait: must be opinion/experience question, not quiz
    - Hooks: maximize stop-scroll potential
+   - social_description: friendly, approachable 2-3 sentence social-media description a child could understand; hook → why it's fun/useful → gentle invite to watch & share
    - Tone: energetic and viral, not academic
 
 2. Deduplicate conservatively:
@@ -68,6 +70,84 @@ Return ONLY valid JSON array, no other text.""",
    - Emotionally flat / zero shareability
 
 4. Re-rank by clip_score descending.
+
+Return ONLY valid JSON array, no other text.""",
+
+    "Refine Clips (No Translate)": """Maximize virality per retained clip. Do NOT translate any text—keep the original language of every field.
+
+1. Improve content (do NOT change "title"):
+   - Captions: enforce hook → insight → CTA → hashtags structure. Add power words
+   - Topics: make emotional/curiosity-driven, not generic labels
+   - comment_bait: must be opinion/experience question, not quiz
+   - Hooks: maximize stop-scroll potential
+   - social_description: friendly, approachable 2-3 sentence social-media description a child could understand; hook → why it's fun/useful → gentle invite to watch & share
+   - Tone: energetic and viral, not academic
+
+2. Fix caption/topic alignment: ensure the caption and topic tell a coherent story. If the caption doesn't match the topic, rewrite the caption to fit.
+
+3. Deduplicate conservatively:
+   - Remove only if another clip covers the EXACT same moment (not just same theme)
+   - Keep the higher clip_score when forced to choose
+   - When in doubt, keep it
+
+4. Remove only dead weight:
+   - Pure filler ("Welcome everyone, let's get started")
+   - clip_score < 40
+   - Emotionally flat / zero shareability
+
+5. Re-rank by clip_score descending.
+
+Return ONLY valid JSON array, no other text.""",
+
+    "Refine Clips (Translate to English)": """Maximize virality per retained clip. Translate reason, topic, caption, hook, closing_line to English if not already (do NOT translate "title" or "comment_bait").
+
+1. Improve content (do NOT change "title"):
+   - Captions: enforce hook → insight → CTA → hashtags structure. Add power words
+   - Topics: make emotional/curiosity-driven, not generic labels
+   - comment_bait: must be opinion/experience question, not quiz
+   - Hooks: maximize stop-scroll potential
+   - social_description: friendly, approachable 2-3 sentence social-media description a child could understand; hook → why it's fun/useful → gentle invite to watch & share
+   - Tone: energetic and viral, not academic
+
+2. Fix caption/topic alignment: ensure the caption and topic tell a coherent story. If the caption doesn't match the topic, rewrite the caption to fit.
+
+3. Deduplicate conservatively:
+   - Remove only if another clip covers the EXACT same moment (not just same theme)
+   - Keep the higher clip_score when forced to choose
+   - When in doubt, keep it
+
+4. Remove only dead weight:
+   - Pure filler ("Welcome everyone, let's get started")
+   - clip_score < 40
+   - Emotionally flat / zero shareability
+
+5. Re-rank by clip_score descending.
+
+Return ONLY valid JSON array, no other text.""",
+
+    "Refine Clips (Translate to Target Language)": """Maximize virality per retained clip. Translate reason, topic, caption, hook, closing_line to {TARGET_LANGUAGE} if not already in that language (do NOT translate "title" or "comment_bait").
+
+1. Improve content (do NOT change "title"):
+   - Captions: enforce hook → insight → CTA → hashtags structure. Add power words
+   - Topics: make emotional/curiosity-driven, not generic labels
+   - comment_bait: must be opinion/experience question, not quiz
+   - Hooks: maximize stop-scroll potential
+   - social_description: friendly, approachable 2-3 sentence social-media description a child could understand; hook → why it's fun/useful → gentle invite to watch & share
+   - Tone: energetic and viral, not academic
+
+2. Fix caption/topic alignment: ensure the caption and topic tell a coherent story. If the caption doesn't match the topic, rewrite the caption to fit.
+
+3. Deduplicate conservatively:
+   - Remove only if another clip covers the EXACT same moment (not just same theme)
+   - Keep the higher clip_score when forced to choose
+   - When in doubt, keep it
+
+4. Remove only dead weight:
+   - Pure filler ("Welcome everyone, let's get started")
+   - clip_score < 40
+   - Emotionally flat / zero shareability
+
+5. Re-rank by clip_score descending.
 
 Return ONLY valid JSON array, no other text.""",
 

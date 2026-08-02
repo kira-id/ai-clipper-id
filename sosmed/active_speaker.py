@@ -401,6 +401,14 @@ def compute_active_speaker_crop_regions(
 
     # Mouth signals keyed by track id, indexed by frame
     mouth_signals: dict[int, list[float]] = {}
+    track_gender: dict[int, str] = {}
+    _face_enabled = True
+    try:
+        from .gender_face import detect_face_and_gender
+    except Exception as e:  # module missing — skip face/gender, keep person-box crop
+        log("WARN", f"gender_face module unavailable: {e} — falling back to person-box framing")
+        _face_enabled = False
+
     for fi, boxes in enumerate(per_frame_boxes):
         frame = frame_by_idx.get(fi)
         for box in boxes:
@@ -409,6 +417,20 @@ def compute_active_speaker_crop_regions(
                 continue
             mouth_signals.setdefault(tid, [])
             mouth_signals[tid].append(_mouth_motion_score(frame, box) if frame is not None else 0.0)
+
+            # Detect the face inside the person box so the close-up frames the
+            # speaker's FACE/mouth (not their torso), and classify gender.
+            if _face_enabled and frame is not None:
+                try:
+                    face, gender = detect_face_and_gender(frame, box)
+                    if face:
+                        box["face_box"] = face
+                    if gender:
+                        # Majority vote: keep the first non-None gender seen.
+                        track_gender.setdefault(tid, gender)
+                        box["gender"] = gender
+                except Exception as e:
+                    log("DEBUG", f"Face/gender detection skipped for track {tid}: {e}")
 
     # Audio envelope (required — no silent fallback to largest-person tracking)
     audio_env = _audio_envelope(video_path)
@@ -472,8 +494,17 @@ def compute_active_speaker_crop_regions(
                 continue
             for box in per_frame_boxes[fi]:
                 if box.get("track_id") == tid:
-                    cx = (box["x1"] + box["x2"]) / 2.0
-                    cy = (box["y1"] + box["y2"]) / 2.0
+                    # Prefer the detected FACE box (mouth/eyes region) so the
+                    # close-up frames the speaker's face, not their torso.
+                    fb = box.get("face_box")
+                    if fb:
+                        fx1, fy1, fx2, fy2 = fb["x1"], fb["y1"], fb["x2"], fb["y2"]
+                    else:
+                        fx1, fy1, fx2, fy2 = box["x1"], box["y1"], box["x2"], box["y2"]
+                    cx = (fx1 + fx2) / 2.0
+                    # Bias the vertical center slightly DOWN toward the mouth/lower
+                    # face (between nose and chin) so the crop isn't forehead-heavy.
+                    cy = fy1 * 0.35 + fy2 * 0.65
                     break
             if cx is not None:
                 break
@@ -481,8 +512,15 @@ def compute_active_speaker_crop_regions(
         if cx is None:
             # Track not visible this segment — keep previous pan position
             cx, cy = prev_cx, prev_cy
+        elif prev_tid != tid and prev_tid >= 0:
+            # Different speaker from the previous segment: HARD CUT (jump), not a
+            # linear pan. A smooth transition between two people would sweep
+            # across the scene and make viewers dizzy. Snap straight to the new
+            # speaker with no interpolation.
+            pass
         else:
-            # Smooth transition
+            # Same speaker across segments: gentle smoothing is fine (keeps a
+            # single talking head stable without jitter).
             cx = prev_cx * 0.3 + cx * 0.7
             cy = prev_cy * 0.3 + cy * 0.7
 
@@ -498,6 +536,7 @@ def compute_active_speaker_crop_regions(
             "x": crop_x, "y": crop_y,
             "w": crop_w, "h": crop_h,
             "track_id": tid,
+            "gender": track_gender.get(tid),
         })
 
     return segments

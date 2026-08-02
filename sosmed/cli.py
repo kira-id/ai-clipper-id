@@ -200,7 +200,7 @@ def main() -> None:
         epilog=(
             "Environment variables:\n"
             "  OPENROUTER_API_KEY   OpenRouter key (default backend, free model)\n"
-            "  OPENROUTER_MODEL     Override default model on OpenRouter\n"
+            "  OPENROUTER_MODEL     Last-resort fallback model on OpenRouter\n"
             "  OLLAMA_MODEL         Local Ollama model name (default: llama3.1)\n"
             "\n"
             "Configuration:\n"
@@ -276,6 +276,10 @@ def main() -> None:
     ap.add_argument("--subtitle-position", default=defaults["subtitle_position"],
                     choices=["center", "upper", "lower"],
                     help=f"Subtitle position (default: {defaults['subtitle_position']})")
+    ap.add_argument("--subtitle-font-size", type=float,
+                    default=defaults.get("subtitle_font_size_pct"),
+                    help="Subtitle font size as %% of vertical resolution "
+                         "(default: from config or 3.2; larger = bigger text)")
     ap.add_argument("--title", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="Overlay clip title at the top of the video (default: off)")
@@ -444,6 +448,7 @@ def main() -> None:
                 output_dir=output_dir,
                 subtitles=args.subtitles,
                 subtitle_position=args.subtitle_position,
+                subtitle_font_size_pct=args.subtitle_font_size,
                 enable_title=args.title,
                 orientation=args.orientation,
                 enable_crop=args.crop,
@@ -713,6 +718,7 @@ def main() -> None:
             output_dir=output_dir,
             subtitles=args.subtitles,
             subtitle_position=args.subtitle_position,
+            subtitle_font_size_pct=args.subtitle_font_size,
             enable_title=args.title,
             orientation=args.orientation,
             enable_crop=args.crop,

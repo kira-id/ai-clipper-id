@@ -27,16 +27,29 @@ from .utils import log
 from .config import get_cta_settings
 from . import pipeline_cache as pc
 
+
+def _opt_float(opts: dict, key: str) -> float | None:
+    """Read an optional float option (e.g. subtitle font size pct).
+
+    Returns None when the key is missing or empty so callers fall back to
+    their configured default.
+    """
+    v = opts.get(key, None)
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
 # ── Ordered pipeline steps (drives the dashboard stepper) ──────────────────
 STEPS = [
     "upload",
     "transcribe",
     "prefilter",
     "energy",
-    "llm_select",
-    "refine",
-    "extract",
-    "render",
+    "select_refine",
+    "build",
     "done",
 ]
 
@@ -174,8 +187,20 @@ class Job:
             }
 
 
+# Per-video execution guard. Two concurrent runs for the SAME video write to the
+# same clips/<VideoName>/ output path (keyed only by video stem); the second
+# ffmpeg re-encode truncates the first's in-progress file with -y, producing a
+# corrupt MP4 ("Invalid NAL unit size … Error splitting the input into NAL
+# units") that then fails post-processing. This dedup guard prevents that.
 JOBS: dict[str, Job] = {}
-_JOBS_LOCK = threading.Lock()
+# RLock so re-entrant helper calls (e.g. run_job holding _JOBS_LOCK while
+# calling _find_running_job_for, which also locks) don't deadlock.
+_JOBS_LOCK = threading.RLock()
+
+
+def _video_lock_key(video_path: str) -> str:
+    """Stable key for a video across submissions (resolved absolute path)."""
+    return str(Path(video_path).resolve())
 
 
 def get_job(job_id: str) -> Job | None:
@@ -183,11 +208,48 @@ def get_job(job_id: str) -> Job | None:
         return JOBS.get(job_id)
 
 
+def _find_running_job_for(video_path: str) -> Job | None:
+    """Return an in-flight Job for the same video, if any (else None).
+
+    Two concurrent runs for the SAME video re-encode into the same
+    clips/<VideoName>/ path; the second ffmpeg -y truncates the first's
+    in-progress file, yielding a corrupt MP4 that fails post-processing.
+    """
+    key = _video_lock_key(video_path)
+    with _JOBS_LOCK:
+        for job in JOBS.values():
+            if (not job.finished
+                    and _video_lock_key(job.video_path) == key):
+                return job
+    return None
+
+
 def run_job(video_path: str, options: dict) -> Job:
-    """Create a Job, start it in a background thread, return it immediately."""
+    """Create a Job, start it in a background thread, return it immediately.
+
+    If another run for the SAME video is already in flight, returns that
+    running Job instead of starting a competing one. Competing ffmpeg
+    re-encodes would clobber each other's output (same clips/<Video>/ path),
+    writing a corrupt MP4.
+    """
+    existing = _find_running_job_for(video_path)
+    if existing is not None:
+        log("WARN",
+            f"A job for {Path(video_path).name} is already running "
+            f"(job_id={existing.id}); returning it instead of starting a "
+            f"duplicate run that would overwrite its output.")
+        return existing
+
     job_id = f"{int(time.time()*1000)}-{Path(video_path).stem}"
     job = Job(job_id, video_path, options)
     with _JOBS_LOCK:
+        # re-check under lock in case two requests raced past the first check
+        if _find_running_job_for(video_path) is not None:
+            dup = _find_running_job_for(video_path)
+            log("WARN",
+                f"Duplicate concurrent submission for {Path(video_path).name} "
+                f"raced through; returning existing job {dup.id}.")
+            return dup
         JOBS[job_id] = job
 
     t = threading.Thread(target=_run, args=(job,), daemon=True)
@@ -281,29 +343,26 @@ def _run(job: Job) -> None:
             "prefilter": pc.signature(
                 "prefilter", opts.get("vad_min_silence", 400)),
             "energy": pc.signature("energy"),
-            "llm_select": pc.signature(
+            "select_refine": pc.signature(
                 opts.get("min", 15), opts.get("max", 60),
                 min(int(opts.get("max_clips", 10)), 72),
                 opts.get("min_score", 55),
                 opts.get("chunk_duration", 360.0),
                 opts.get("chunk_overlap", 60.0),
                 opts.get("system_prompt") or "",
-            ),
-            "refine": pc.signature(
                 opts.get("target_language", "en"),
                 opts.get("llm_model"),
             ),
-            "extract": pc.signature(
-                opts.get("encoding_preset"), opts.get("encoding_crf")),
-            "render": pc.signature(
+            "build": pc.signature(
+                opts.get("encoding_preset"), opts.get("encoding_crf"),
                 opts.get("subtitles", True), opts.get("title", False),
                 opts.get("orientation", "auto"), opts.get("crop", False),
                 opts.get("split_screen", False),
                 opts.get("active_speaker", True),
                 opts.get("remove_silence", False), opts.get("max_silence", 1.5),
                 opts.get("cta", False), opts.get("subtitle_position", "lower"),
+                opts.get("subtitle_font_size_pct"),
                 opts.get("target_language", "en"),
-                opts.get("encoding_preset"), opts.get("encoding_crf"),
             ),
         }
 
@@ -417,70 +476,50 @@ def _run(job: Job) -> None:
                               f"{len(energy_events)} energy events found")
             job.set_result("energy", _energy_result(energy_events, cached=False))
 
-        # 4. LLM CLIP SELECTION (with retry — the free LLM can occasionally
-        #    return 0 clips on a valid transcript; retry by relaxing the
-        #    min-score threshold before giving up.)
-        job.set_step("llm_select", "LLM is choosing the best clips…")
+        # 5. SELECT & REFINE (merged: LLM clip selection + boundary/caption
+        #    refinement). Cached as a single step — re-running only costs a
+        #    cache lookup, not a fresh LLM selection + refinement pass.
+        job.set_step("select_refine", "LLM selecting + refining clips…")
         raw_clips_cache = output_dir / ".clips_raw.json"
         # Capture cache state BEFORE running find_clips — that call writes
         # .clips_raw.json, so checking existence afterwards would always be
         # True (and falsely report "cached" on a fresh run).
         llm_was_cached = raw_clips_cache.exists()
-        clips = None
-        last_score = int(opts.get("min_score", 55))
-        for attempt in range(3):
-            effective_score = max(0, last_score - attempt * 15)
-            if attempt:
-                job.add_log(f"Retry {attempt}: lowering min-score to "
-                            f"{effective_score}", "WARN")
-            clips = find_clips(
-                filtered,
-                min_duration=opts.get("min", 15),
-                max_duration=opts.get("max", 60),
-                max_clips=min(int(opts.get("max_clips", 10)), 72),
-                min_score=effective_score,
-                llm_model=opts.get("llm_model"),
-                api_key=opts.get("api_key"),
-                video_duration=_get_video_duration(video),
-                chunk_duration=opts.get("chunk_duration", 360.0),
-                chunk_overlap=opts.get("chunk_overlap", 60.0),
-                raw_clips_cache_file=raw_clips_cache,
-                energy_events=energy_events,
-                system_prompt=opts.get("system_prompt") or None,
-            )
-            if clips:
-                break
-        job.cache["llm_select"] = llm_was_cached
-        job.complete_step("llm_select",
-                          f"{len(clips)} clips chosen by LLM")
-        job.set_result("llm_select", {
-            "count": len(clips),
-            "min_score": last_score,
-            "cached": llm_was_cached,
-            "clips": [{
-                "rank": c.get("rank"),
-                "start": round(float(c.get("start", 0)), 1),
-                "end": round(float(c.get("end", 0)), 1),
-                "score": round(float(c.get("clip_score", 0) or 0), 1),
-                "title": _trim(c.get("title", ""), 120),
-                "topic": _trim(c.get("topic", ""), 140),
-            } for c in clips[:24]],
-        })
-
-        if not clips:
-            raise RuntimeError("No engaging clips found. Try lowering "
-                               "--min-score or widening the duration range.")
-
-        # 5. REFINE
-        job.set_step("refine", "Optimizing boundaries & improving captions…")
-        cached = pc.get_cached(cdir, "refine", sig["refine"])
+        cached = pc.get_cached(cdir, "select_refine", sig["select_refine"])
         if cached is not None:
             clips = cached["clips"]
-            job.cache["refine"] = True
-            job.complete_step("refine",
-                              f"{len(clips)} clips finalized (cached)")
-            job.set_result("refine", _refine_result(clips, cached=True))
+            job.cache["select_refine"] = True
+            job.complete_step("select_refine",
+                              f"{len(clips)} clips chosen & finalized (cached)")
+            job.set_result("select_refine", _refine_result(clips, cached=True))
         else:
+            clips = None
+            last_score = int(opts.get("min_score", 55))
+            for attempt in range(3):
+                effective_score = max(0, last_score - attempt * 15)
+                if attempt:
+                    job.add_log(f"Retry {attempt}: lowering min-score to "
+                                f"{effective_score}", "WARN")
+                clips = find_clips(
+                    filtered,
+                    min_duration=opts.get("min", 15),
+                    max_duration=opts.get("max", 60),
+                    max_clips=min(int(opts.get("max_clips", 10)), 72),
+                    min_score=effective_score,
+                    llm_model=opts.get("llm_model"),
+                    api_key=opts.get("api_key"),
+                    video_duration=_get_video_duration(video),
+                    chunk_duration=opts.get("chunk_duration", 360.0),
+                    chunk_overlap=opts.get("chunk_overlap", 60.0),
+                    raw_clips_cache_file=raw_clips_cache,
+                    energy_events=energy_events,
+                    system_prompt=opts.get("system_prompt") or None,
+                )
+                if clips:
+                    break
+            if not clips:
+                raise RuntimeError("No engaging clips found. Try lowering "
+                                   "--min-score or widening the duration range.")
             clips = smart_adjust_clip_boundaries(
                 clips, segments,
                 min_duration=5.0,
@@ -498,40 +537,40 @@ def _run(job: Job) -> None:
             # ensure filenames
             from .cli import _ensure_filenames
             _ensure_filenames(clips)
-            pc.put_cached(cdir, "refine",
+            pc.put_cached(cdir, "select_refine",
                           {"clips": clips},
-                          sig_parts=(sig["refine"],))
-            job.cache["refine"] = True
-            job.complete_step("refine",
-                              f"{len(clips)} clips finalized")
-            job.set_result("refine", _refine_result(clips, cached=False))
+                          sig_parts=(sig["select_refine"],))
+            job.cache["select_refine"] = True
+            job.complete_step("select_refine",
+                              f"{len(clips)} clips chosen & finalized")
+            job.set_result("select_refine",
+                           _refine_result(clips, cached=False))
 
         # persist metadata
         from .utils import save_clips_to_disk
         save_clips_to_disk(clips, output_dir)
 
-        # 6. EXTRACT
-        job.set_step("extract", "Cutting raw clips with ffmpeg…")
-        # render consumes the raw extract files (postprocess deletes them), so
-        # on a cache-only rerun the raw files may no longer be on disk. If the
-        # render step is ALSO cached we don't need them — treat extract as a
-        # hit anyway. If render is not cached we must re-extract to recover
-        # the raw files it needs.
-        render_cached = pc.get_cached(cdir, "render", sig["render"]) is not None
-        cached = pc.get_cached(cdir, "extract", sig["extract"])
+        # 6. BUILD (merged: extract raw clips + render subtitles/crop/cta).
+        #    The raw intermediate clips are an internal detail of this stage —
+        #    only the final rendered outputs are cached, so a re-run that hits
+        #    this cache skips BOTH the ffmpeg cut and the post-processing pass.
+        job.set_step("build", "Cutting + rendering clips…")
+        any_pp = (opts.get("subtitles", True) or opts.get("title", False)
+                  or str(opts.get("orientation", "auto")) != "auto"
+                  or opts.get("crop", False) or opts.get("remove_silence", False)
+                  or opts.get("cta", False))
+        cached = pc.get_cached(cdir, "build", sig["build"])
         if cached is not None:
-            raw_outputs = cached["outputs"]
-            raw_outputs = [p for p in raw_outputs if Path(p).exists()]
-            if raw_outputs or render_cached:
-                job.cache["extract"] = True
-                job.complete_step("extract",
-                                  f"{len(raw_outputs)} raw clips (cached)")
-                job.set_result("extract", _extract_result(raw_outputs, cached=True))
-            else:
-                # signature matched but raw files were consumed and render
-                # needs them — fall through to a real re-extract below
-                cached = None
-        if cached is None:
+            outputs = cached["outputs"]
+            outputs = [p for p in outputs if Path(p).exists()]
+            # re-attach subtitle words so the download/preview still works
+            for clip in clips:
+                clip["_subtitle_words"] = []
+            job.cache["build"] = bool(outputs)
+            job.complete_step("build",
+                              f"{len(outputs)} clips built (cached)")
+            job.set_result("build", _render_result(outputs, cached=True))
+        else:
             raw_outputs = extract_clips(
                 video, clips,
                 output_dir=output_dir,
@@ -539,89 +578,63 @@ def _run(job: Job) -> None:
                 encoding_preset=opts.get("encoding_preset"),
                 encoding_crf=opts.get("encoding_crf"),
             )
-            pc.put_cached(cdir, "extract",
-                          {"outputs": raw_outputs},
-                          files=raw_outputs,
-                          sig_parts=(sig["extract"],))
-            job.cache["extract"] = True
-            job.complete_step("extract",
-                              f"{len(raw_outputs)} raw clips extracted")
-            job.set_result("extract", _extract_result(raw_outputs, cached=False))
+            if any_pp and raw_outputs:
+                # prepare subtitle words for ALL clips in one batched LLM call
+                # (previously one serial call per clip — the dominant runtime cost)
+                from .llm import batch_translate_subtitles
+                try:
+                    subtitle_map = batch_translate_subtitles(
+                        clips, segments,
+                        llm_model=opts.get("llm_model"),
+                        api_key=opts.get("api_key"),
+                        fix_errors=True,
+                        target_language=opts.get("target_language", "en"),
+                    )
+                    for clip in clips:
+                        clip["_subtitle_words"] = subtitle_map.get(
+                            int(clip.get("rank", 0)), [])
+                except Exception as e:
+                    job.add_log(f"Subtitle batch translation failed: {e}", "WARN")
+                    for clip in clips:
+                        clip["_subtitle_words"] = []
 
-        # 7. RENDER (subtitles / crop / cta / silence removal)
-        job.set_step("render", "Burning subtitles & post-processing…")
-        any_pp = (opts.get("subtitles", True) or opts.get("title", False)
-                  or str(opts.get("orientation", "auto")) != "auto"
-                  or opts.get("crop", False) or opts.get("remove_silence", False)
-                  or opts.get("cta", False))
-        cached = pc.get_cached(cdir, "render", sig["render"])
-        if cached is not None:
-            outputs = cached["outputs"]
-            outputs = [p for p in outputs if Path(p).exists()]
-            # re-attach subtitle words so the download/preview still works
-            for clip in clips:
-                clip["_subtitle_words"] = []
-            job.cache["render"] = bool(outputs)
-            job.complete_step("render",
-                              f"{len(outputs)} clips rendered (cached)")
-            job.set_result("render", _render_result(outputs, cached=True))
-        elif any_pp and raw_outputs:
-            # prepare subtitle words for ALL clips in one batched LLM call
-            # (previously one serial call per clip — the dominant runtime cost)
-            from .llm import batch_translate_subtitles
-            try:
-                subtitle_map = batch_translate_subtitles(
-                    clips, segments,
-                    llm_model=opts.get("llm_model"),
-                    api_key=opts.get("api_key"),
-                    fix_errors=True,
-                    target_language=opts.get("target_language", "en"),
+                _cta_cfg = {**get_cta_settings(),
+                            "enabled": bool(opts.get("cta", False))}
+                crop_target = ("vertical"
+                               if str(opts.get("orientation", "auto")) in
+                               ("portrait", "vertical", "auto")
+                               else "horizontal")
+                outputs = postprocess_clips(
+                    raw_outputs, clips, segments,
+                    output_dir=output_dir,
+                    subtitles=opts.get("subtitles", True),
+                    subtitle_position=opts.get("subtitle_position", "lower"),
+                    subtitle_font_size_pct=_opt_float(opts, "subtitle_font_size_pct"),
+                    enable_title=opts.get("title", False),
+                    orientation=opts.get("orientation", "auto"),
+                    enable_crop=opts.get("crop", False),
+                    crop_target=crop_target,
+                    enable_split_screen=opts.get("split_screen", False),
+                    enable_active_speaker=opts.get("active_speaker", True),
+                    enable_silence_removal=opts.get("remove_silence", False),
+                    max_silence=opts.get("max_silence", 1.5),
+                    cta_config=_cta_cfg,
+                    encoding_preset=opts.get("encoding_preset"),
+                    encoding_crf=opts.get("encoding_crf"),
                 )
-                for clip in clips:
-                    clip["_subtitle_words"] = subtitle_map.get(
-                        int(clip.get("rank", 0)), [])
-            except Exception as e:
-                job.add_log(f"Subtitle batch translation failed: {e}", "WARN")
-                for clip in clips:
-                    clip["_subtitle_words"] = []
-
-            _cta_cfg = {**get_cta_settings(),
-                        "enabled": bool(opts.get("cta", False))}
-            crop_target = ("vertical"
-                           if str(opts.get("orientation", "auto")) in
-                           ("portrait", "vertical", "auto")
-                           else "horizontal")
-            outputs = postprocess_clips(
-                raw_outputs, clips, segments,
-                output_dir=output_dir,
-                subtitles=opts.get("subtitles", True),
-                subtitle_position=opts.get("subtitle_position", "lower"),
-                enable_title=opts.get("title", False),
-                orientation=opts.get("orientation", "auto"),
-                enable_crop=opts.get("crop", False),
-                crop_target=crop_target,
-                enable_split_screen=opts.get("split_screen", False),
-                enable_active_speaker=opts.get("active_speaker", True),
-                enable_silence_removal=opts.get("remove_silence", False),
-                max_silence=opts.get("max_silence", 1.5),
-                cta_config=_cta_cfg,
-                encoding_preset=opts.get("encoding_preset"),
-                encoding_crf=opts.get("encoding_crf"),
-            )
-            pc.put_cached(cdir, "render",
+            else:
+                outputs = raw_outputs
+            pc.put_cached(cdir, "build",
                           {"outputs": outputs},
                           files=outputs,
-                          sig_parts=(sig["render"],))
-            job.cache["render"] = True
-            job.complete_step("render",
-                              f"{len(outputs)} clips rendered")
-            job.set_result("render", _render_result(outputs, cached=False))
-        else:
-            outputs = raw_outputs
-            job.cache["render"] = False
-            job.complete_step("render", "raw clips (no post-processing)")
-            job.set_result("render", _render_result(outputs, cached=False,
-                                                    note="no post-processing"))
+                          sig_parts=(sig["build"],))
+            job.cache["build"] = True
+            job.complete_step("build",
+                              f"{len(outputs)} clips built"
+                              + ("" if any_pp else " (raw, no post-processing)"))
+            job.set_result("build", _render_result(
+                outputs, cached=False,
+                note="" if any_pp else "no post-processing"))
 
         # collect outputs + metadata
         for clip in clips:
@@ -715,14 +728,6 @@ def _refine_result(clips: list, cached: bool) -> dict:
             "title": _trim(c.get("title", ""), 120),
             "caption": _trim(c.get("caption", ""), 160),
         } for c in clips[:24]],
-    }
-
-
-def _extract_result(raw_outputs: list, cached: bool) -> dict:
-    return {
-        "count": len(raw_outputs),
-        "cached": cached,
-        "files": [Path(p).name for p in raw_outputs[:24]],
     }
 
 
